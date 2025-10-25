@@ -3,6 +3,7 @@ import os
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from o2o.datasets import load_npz_dataset
@@ -21,6 +22,9 @@ def main():
     parser.add_argument("--hidden", type=int, nargs="*", default=[256, 256])
     parser.add_argument("--activation", type=str, default="tanh")
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--entropy_coeff", type=float, default=0.01, help="Entropy regularization for discrete")
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--use_cosine", action="store_true", help="Use cosine LR schedule")
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu"
@@ -53,6 +57,14 @@ def main():
 
     N = states.shape[0]
     steps_per_epoch = int(np.ceil(N / args.batch_size))
+    # Optional LR scheduler
+    scheduler = None
+    if args.use_cosine:
+        # T_max in steps (epochs * steps_per_epoch)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=max(1, args.epochs)
+        )
+
     for epoch in range(args.epochs):
         perm = torch.randperm(N, device=device)
         total_loss = 0.0
@@ -62,14 +74,21 @@ def main():
             a = actions[idx]
             dist = actor(s)
             if spec.discrete:
-                loss = -dist.log_prob(a).mean()
+                # maximize log-likelihood with entropy regularization
+                logp = dist.log_prob(a)
+                ent = dist.entropy().mean()
+                loss = -(logp.mean() + args.entropy_coeff * ent)
             else:
                 # maximize log likelihood under squashed Gaussian
                 loss = -dist.log_prob(a).mean()
             opt.zero_grad()
             loss.backward()
+            if args.grad_clip and args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(actor.parameters(), args.grad_clip)
             opt.step()
             total_loss += loss.item() * s.shape[0]
+        if scheduler is not None:
+            scheduler.step()
         print(f"[BC] epoch {epoch} loss {total_loss / N:.4f}")
 
     dirn = os.path.dirname(args.out_actor)

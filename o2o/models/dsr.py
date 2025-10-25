@@ -103,6 +103,8 @@ def train_dsr(
     action_noise: float = 0.0,
     temperature: float = 1.0,
     log_every: int = 100,
+    weight_decay: float = 0.0,
+    grad_clip: float | None = None,
 ) -> DSR:
     rng = np.random.default_rng()
     n = states.shape[0]
@@ -124,7 +126,10 @@ def train_dsr(
         a_train = (actions - a_mean) / a_std
 
     net = DSRNet(state_dim, action_dim, hidden=hidden, activation=activation).to(device)
-    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    if weight_decay and weight_decay > 0.0:
+        opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
+    else:
+        opt = torch.optim.Adam(net.parameters(), lr=lr)
 
     # training loop
     steps_per_epoch = int(np.ceil(n / batch_size))
@@ -163,6 +168,8 @@ def train_dsr(
 
             opt.zero_grad()
             loss.backward()
+            if grad_clip and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
             opt.step()
 
             global_it = epoch * steps_per_epoch + it

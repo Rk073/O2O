@@ -31,6 +31,11 @@ def main():
     parser.add_argument("--bonus_sigma", type=float, default=0.15)
     parser.add_argument("--bonus_type", type=str, default="boundary", choices=["boundary", "entropy", "ucb"])  # new
     parser.add_argument("--use_bonus", action="store_true")
+    # adaptive knobs
+    parser.add_argument("--adaptive_bonus", action="store_true", help="Adapt bonus with performance")
+    parser.add_argument("--bonus_alpha", type=float, default=1.0, help="Scale for adaptive bonus")
+    parser.add_argument("--target_return", type=float, default=200.0, help="Target return for scaling")
+    parser.add_argument("--dynamic_pessimism", action="store_true", help="Adapt pessimism by support")
     # baselines & init
     parser.add_argument("--no_pessimism", action="store_true")
     parser.add_argument("--no_bonus", action="store_true")
@@ -187,11 +192,18 @@ def main():
                 sup_std = 0.0
 
             # intrinsic bonus based on type
-            bonus_arr = agent.compute_bonus(np.array([sup_mean], dtype=np.float32), np.array([sup_std], dtype=np.float32))
+            bonus_arr = agent.compute_bonus(
+                np.array([sup_mean], dtype=np.float32), np.array([sup_std], dtype=np.float32)
+            )
             bonus = float(max(0.0, float(bonus_arr[0])))
 
             # scale bonus by running reward std
             rew_std = float(np.sqrt(rew_var / max(1.0, rew_cnt - 1.0)))
+            # optional adaptive scaling by performance
+            if args.adaptive_bonus and len(ep_returns) > 0:
+                avg_return = float(np.mean(ep_returns))
+                perf_scale = max(0.1, 1.0 - avg_return / max(1e-6, args.target_return))
+                bonus *= (args.bonus_alpha * perf_scale)
             bonus = float(np.clip(bonus, 0.0, 0.5 * max(1e-6, rew_std)))
             r_total = float(r + bonus)
 
@@ -240,6 +252,13 @@ def main():
             "support": np.array(buf["support"], dtype=np.float32),
             "support_std": np.array(buf["support_std"], dtype=np.float32),
         }
+        # dynamic pessimism: decrease as support rises
+        base_beta = pess_beta
+        if args.dynamic_pessimism and batch["support"].size:
+            sup_mean_epoch = float(np.mean(batch["support"]))
+            agent.pessimism_beta = base_beta * max(0.1, 1.0 - sup_mean_epoch)
+        else:
+            agent.pessimism_beta = base_beta
         metrics = agent.update(batch, minibatch_size=minibatch_size, train_iters=train_iters)
 
         # clear buffer

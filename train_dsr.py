@@ -24,6 +24,8 @@ def main():
     parser.add_argument("--action_noise", type=float, default=0.0)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--weight_decay", type=float, default=0.0, help="AdamW weight decay (0 to disable)")
+    parser.add_argument("--grad_clip", type=float, default=0.0, help="Gradient clipping norm (0 to disable)")
     args = parser.parse_args()
 
     offline = load_npz_dataset(args.offline_path, args.max_samples)
@@ -47,6 +49,8 @@ def main():
         device=device,
         action_noise=args.action_noise,
         temperature=args.temperature,
+        weight_decay=args.weight_decay,
+        grad_clip=args.grad_clip,
     )
 
     os.makedirs(os.path.dirname(args.dsr_out), exist_ok=True)
@@ -56,4 +60,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
