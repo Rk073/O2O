@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from o2o.models.dsr import DSR
-from o2o.utils.support_bonus import boundary_bonus
+from o2o.utils.support_bonus import boundary_bonus, entropy_bonus, ucb_bonus
 
 
 def mlp(sizes, activation="tanh", out_act=None):
@@ -114,6 +114,7 @@ class PPOAgent:
     bonus_center: float
     bonus_sigma: float
     use_bonus: bool
+    bonus_type: str = "boundary"  # one of: boundary, entropy, ucb
 
     def __post_init__(self):
         self.actor.to(self.device)
@@ -149,6 +150,11 @@ class PPOAgent:
         ret = torch.as_tensor(buf["ret"], dtype=torch.float32, device=self.device)
         logp_old = torch.as_tensor(buf["logp"], dtype=torch.float32, device=self.device)
         support = torch.as_tensor(buf["support"], dtype=torch.float32, device=self.device)
+        support_std = torch.as_tensor(
+            buf.get("support_std", np.zeros_like(buf["support"])),
+            dtype=torch.float32,
+            device=self.device,
+        )
 
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
@@ -174,11 +180,15 @@ class PPOAgent:
                 (loss_actor - self.ent_coeff * ent).backward()
                 self.opt_actor.step()
 
-                # Critic loss with pessimism regularizer
+                # Critic loss with overestimation-only pessimism and LCB weighting
                 v = self.critic(obs[mb])
                 mse = F.mse_loss(v, ret[mb])
-                pess_w = (1.0 - support[mb]).pow(self.pessimism_gamma)
-                pess_reg = (pess_w * (v.detach() if False else v).pow(2)).mean()
+                # Lower confidence bound gate
+                lcbs = (support[mb] - 2.0 * support_std[mb]).clamp(0.0, 1.0)
+                # penalize only over-estimation
+                over = F.relu(v - ret[mb])
+                pess_w = (1.0 - lcbs).pow(self.pessimism_gamma)
+                pess_reg = (pess_w * over.pow(2)).mean()
                 loss_critic = self.vf_coeff * mse + self.pessimism_beta * pess_reg
 
                 self.opt_critic.zero_grad()
@@ -210,12 +220,38 @@ class PPOAgent:
 
     def compute_support(self, obs: np.ndarray, act: np.ndarray) -> float:
         with torch.no_grad():
-            sup = self.dsr.support(obs[None, ...], act[None, ...]).item()
+            sup = self.dsr.support(
+                torch.as_tensor(obs[None, ...], dtype=torch.float32, device=self.device),
+                torch.as_tensor(
+                    act[None, ...],
+                    dtype=torch.float32 if not self.discrete else torch.long,
+                    device=self.device,
+                ),
+            ).item()
         return sup
 
-    def compute_bonus(self, support: np.ndarray) -> np.ndarray:
-        if not self.use_bonus:
-            return np.zeros_like(support)
+    def compute_entropy_bonus(self, support: np.ndarray) -> np.ndarray:
+        sup_t = torch.as_tensor(support, dtype=torch.float32, device=self.device)
+        return entropy_bonus(sup_t, eta=self.bonus_eta).detach().cpu().numpy()
+
+    def compute_ucb_bonus(self, support_mean: np.ndarray, support_std: np.ndarray) -> np.ndarray:
+        m = torch.as_tensor(support_mean, dtype=torch.float32, device=self.device)
+        s = torch.as_tensor(support_std, dtype=torch.float32, device=self.device)
+        return ucb_bonus(m, s, eta=self.bonus_eta, kappa=1.0).detach().cpu().numpy()
+
+    def compute_boundary_bonus(self, support: np.ndarray) -> np.ndarray:
         sup_t = torch.as_tensor(support, dtype=torch.float32, device=self.device)
         b = boundary_bonus(sup_t, center=self.bonus_center, sigma=self.bonus_sigma, eta=self.bonus_eta)
         return b.detach().cpu().numpy()
+
+    def compute_bonus(self, support_mean: np.ndarray, support_std: np.ndarray | None = None) -> np.ndarray:
+        if not self.use_bonus:
+            return np.zeros_like(support_mean)
+        if self.bonus_type == "ucb":
+            if support_std is None:
+                support_std = np.zeros_like(support_mean)
+            return self.compute_ucb_bonus(support_mean, support_std)
+        elif self.bonus_type == "entropy":
+            return self.compute_entropy_bonus(support_mean)
+        else:
+            return self.compute_boundary_bonus(support_mean)

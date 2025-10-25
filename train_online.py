@@ -29,6 +29,7 @@ def main():
     parser.add_argument("--bonus_eta", type=float, default=0.1)
     parser.add_argument("--bonus_center", type=float, default=0.7)
     parser.add_argument("--bonus_sigma", type=float, default=0.15)
+    parser.add_argument("--bonus_type", type=str, default="boundary", choices=["boundary", "entropy", "ucb"])  # new
     parser.add_argument("--use_bonus", action="store_true")
     # baselines & init
     parser.add_argument("--no_pessimism", action="store_true")
@@ -85,6 +86,7 @@ def main():
         bonus_center=args.bonus_center,
         bonus_sigma=args.bonus_sigma,
         use_bonus=use_bonus,
+        bonus_type=args.bonus_type,
     )
 
     # optional init from BC
@@ -92,9 +94,21 @@ def main():
         sd = torch.load(args.init_actor, map_location=device)
         agent.actor.load_state_dict(sd)
 
-    obs, _ = env.reset(seed=args.seed)
+    # reset supports both gym and gymnasium
+    reset_out = env.reset(seed=args.seed)
+    obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
     ep_ret, ep_len = 0.0, 0
     ep_returns = deque(maxlen=10)
+
+    # running stats for reward scaling
+    rew_mean, rew_var, rew_cnt = 0.0, 1.0, 1e-6
+
+    def update_running_stats(x: float):
+        nonlocal rew_mean, rew_var, rew_cnt
+        rew_cnt += 1.0
+        delta = x - rew_mean
+        rew_mean += delta / rew_cnt
+        rew_var += delta * (x - rew_mean)
 
     # logger
     logger = None
@@ -117,6 +131,8 @@ def main():
                 "pess_reg",
                 "v_mse",
                 "loss_actor",
+                "bonus_used",
+                "rew_std",
             ],
         )
 
@@ -125,17 +141,58 @@ def main():
     minibatch_size = args.minibatch_size
     train_iters = args.train_iters
 
-    buf = {k: [] for k in ["obs", "act", "rew", "val", "logp", "done", "support"]}
+    buf = {k: [] for k in ["obs", "act", "rew", "val", "logp", "done", "support", "support_std"]}
     t = 0
     while t < total_steps:
         # collect rollout
         for _ in range(steps_per_epoch):
             a, logp, ent = agent.select_action(obs)
-            next_obs, r, done, truncated, _ = env.step(a)
+            step_out = env.step(a)
+            if len(step_out) == 5:
+                next_obs, r, done, truncated, _ = step_out
+            else:
+                # gym API fallback
+                next_obs, r, done, info = step_out
+                truncated = info.get("TimeLimit.truncated", False) if isinstance(info, dict) else False
 
-            # compute support and intrinsic bonus
-            sup = agent.compute_support(obs, np.array(a) if not spec.discrete else np.array([a]))
-            bonus = agent.compute_bonus(np.array([sup]))[0]
+            # compute support (and std via jitter for continuous)
+            if not spec.discrete:
+                a_vec = np.array(a, dtype=np.float32)
+                low = np.array(spec.action_low_vec, dtype=np.float32)
+                high = np.array(spec.action_high_vec, dtype=np.float32)
+                K = 5
+                eps = 0.05 * (high - low)
+                a_jit = np.clip(
+                    a_vec[None, ...]
+                    + np.random.uniform(-eps, eps, size=(K, a_vec.shape[0])).astype(np.float32),
+                    low,
+                    high,
+                )
+                s_rep = np.repeat(obs[None, ...], K, axis=0)
+                with torch.no_grad():
+                    sup_batch = (
+                        agent.dsr.support(
+                            torch.as_tensor(s_rep, dtype=torch.float32, device=agent.device),
+                            torch.as_tensor(a_jit, dtype=torch.float32, device=agent.device),
+                        )
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .reshape(-1)
+                    )
+                sup_mean = float(np.mean(sup_batch))
+                sup_std = float(np.std(sup_batch))
+            else:
+                sup_mean = agent.compute_support(obs, np.array([a]))
+                sup_std = 0.0
+
+            # intrinsic bonus based on type
+            bonus_arr = agent.compute_bonus(np.array([sup_mean], dtype=np.float32), np.array([sup_std], dtype=np.float32))
+            bonus = float(max(0.0, float(bonus_arr[0])))
+
+            # scale bonus by running reward std
+            rew_std = float(np.sqrt(rew_var / max(1.0, rew_cnt - 1.0)))
+            bonus = float(np.clip(bonus, 0.0, 0.5 * max(1e-6, rew_std)))
             r_total = float(r + bonus)
 
             v = agent.evaluate_value(obs)
@@ -145,7 +202,11 @@ def main():
             buf["val"].append(v)
             buf["logp"].append(logp)
             buf["done"].append(float(done or truncated))
-            buf["support"].append(sup)
+            buf["support"].append(sup_mean)
+            buf["support_std"].append(sup_std)
+
+            # update running stats on extrinsic reward only
+            update_running_stats(float(r))
 
             ep_ret += r
             ep_len += 1
@@ -154,7 +215,8 @@ def main():
             obs = next_obs
             if done or truncated:
                 ep_returns.append(ep_ret)
-                obs, _ = env.reset()
+                reset_out = env.reset()
+                obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
                 ep_ret, ep_len = 0.0, 0
 
             if t >= total_steps:
@@ -176,6 +238,7 @@ def main():
             "ret": ret.astype(np.float32),
             "logp": np.array(buf["logp"], dtype=np.float32),
             "support": np.array(buf["support"], dtype=np.float32),
+            "support_std": np.array(buf["support_std"], dtype=np.float32),
         }
         metrics = agent.update(batch, minibatch_size=minibatch_size, train_iters=train_iters)
 
@@ -189,7 +252,7 @@ def main():
         p90 = float(np.percentile(sup, 90)) if sup.size else 0.0
         print(
             f"Steps {t}/{total_steps}  AvgEpRet {avg_ret:.2f}  DSR[mean/p10/p90] {sup_mean:.2f}/{p10:.2f}/{p90:.2f}  "
-            f"pess_reg {metrics['pess_reg']:.4f}"
+            f"pess_reg {metrics['pess_reg']:.4f}  bonus_scale {0.5 * float(np.sqrt(rew_var / max(1.0, rew_cnt - 1.0))):.3f}"
         )
 
         if logger:
@@ -203,6 +266,8 @@ def main():
                     "pess_reg": metrics.get("pess_reg", 0.0),
                     "v_mse": metrics.get("v_mse", 0.0),
                     "loss_actor": metrics.get("loss_actor", 0.0),
+                    "bonus_used": bonus,
+                    "rew_std": float(np.sqrt(rew_var / max(1.0, rew_cnt - 1.0))),
                 }
             )
 
