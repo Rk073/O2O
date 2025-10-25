@@ -1,0 +1,4 @@
+torch
+gymnasium; python_version>='3.8'
+gym; python_version<'3.8'
+numpy
