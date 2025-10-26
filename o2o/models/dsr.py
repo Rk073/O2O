@@ -43,6 +43,7 @@ class DSRMetadata:
     action_low: float | None
     action_high: float | None
     temperature: float
+    calib_temperature: float | None = 1.0
 
 
 class DSR:
@@ -62,7 +63,9 @@ class DSR:
             a = (a - torch.as_tensor(self.meta.action_mean, device=self.device)) / (
                 torch.as_tensor(self.meta.action_std, device=self.device) + 1e-6
             )
-        logits = self.net(s, self._one_hot_if_needed(a)) / max(self.meta.temperature, 1e-6)
+        temp = float(self.meta.temperature) if self.meta.temperature is not None else 1.0
+        ctemp = float(self.meta.calib_temperature) if hasattr(self.meta, 'calib_temperature') and self.meta.calib_temperature is not None else 1.0
+        logits = self.net(s, self._one_hot_if_needed(a)) / max(temp * ctemp, 1e-6)
         return torch.sigmoid(logits)
 
     def _one_hot_if_needed(self, a: torch.Tensor) -> torch.Tensor:
@@ -122,6 +125,12 @@ def train_dsr(
     weight_decay: float = 0.0,
     grad_clip: float | None = None,
     seed: int | None = None,
+    val_split: float = 0.0,
+    early_stop_patience: int = 0,
+    neg_modes: tuple[str, ...] = ("uniform",),
+    neg_weights: tuple[float, ...] | None = None,
+    jitter_std: float = 0.1,
+    calibrate_temperature: bool = False,
 ) -> DSR:
     rng = np.random.default_rng(seed)
     try:
@@ -154,28 +163,90 @@ def train_dsr(
     else:
         opt = torch.optim.Adam(net.parameters(), lr=lr)
 
+    # split train/val
+    idx_all = np.arange(n)
+    val_n = int(n * max(0.0, min(0.5, val_split)))
+    if val_n > 0:
+        rng.shuffle(idx_all)
+        idx_val = idx_all[:val_n]
+        idx_train = idx_all[val_n:]
+    else:
+        idx_train = idx_all
+        idx_val = None
+
+    # helper: negative sampler
+    def gen_negatives(s_pos_np: np.ndarray, a_pos_np: np.ndarray, k: int) -> np.ndarray:
+        mlist = list(neg_modes) if neg_modes else ["uniform"]
+        w = np.array(neg_weights if neg_weights is not None else [1.0] * len(mlist), dtype=np.float32)
+        w = w / (w.sum() + 1e-8)
+        counts = np.maximum(1, np.round(w * k).astype(int))
+        # adjust to sum exactly k
+        diff = k - counts.sum()
+        if diff != 0:
+            counts[0] += diff
+        outs = []
+        B = s_pos_np.shape[0]
+        if discrete:
+            for mode, c in zip(mlist, counts):
+                if c <= 0:
+                    continue
+                if mode == "uniform" or mode == "jitter" or mode == "shuffle":
+                    neg_idx = np.random.randint(0, action_dim, size=(B, c))
+                    a_neg = np.eye(action_dim, dtype=np.float32)[neg_idx]
+                    outs.append(a_neg)
+                else:
+                    continue
+            a_neg_all = np.concatenate(outs, axis=1) if outs else np.zeros((B, k, action_dim), dtype=np.float32)
+            return a_neg_all
+        else:
+            low = action_low if action_low is not None else -1.0
+            high = action_high if action_high is not None else 1.0
+            for mode, c in zip(mlist, counts):
+                if c <= 0:
+                    continue
+                if mode == "uniform":
+                    a_u = np.random.rand(B, c, a_train.shape[1]).astype(np.float32)
+                    a_u = a_u * (high - low) + low
+                    outs.append(a_u)
+                elif mode == "shuffle":
+                    # in-batch shuffled actions
+                    perm = rng.permutation(B)
+                    a_s = np.repeat(a_pos_np[perm][:, None, :], c, axis=1)
+                    outs.append(a_s)
+                elif mode == "jitter":
+                    noise = jitter_std * (high - low) * rng.standard_normal(size=(B, c, a_train.shape[1])).astype(np.float32)
+                    a_j = a_pos_np[:, None, :] + noise
+                    a_j = np.clip(a_j, low, high)
+                    outs.append(a_j)
+            a_neg_all = np.concatenate(outs, axis=1) if outs else np.random.uniform(low, high, size=(B, k, a_train.shape[1])).astype(np.float32)
+            # normalize with dataset stats
+            a_neg_all = (a_neg_all - a_mean) / a_std
+            return a_neg_all
+
     # training loop
-    steps_per_epoch = int(np.ceil(n / batch_size))
+    steps_per_epoch = int(np.ceil(len(idx_train) / batch_size))
+    best_state = None
+    best_val = float("inf")
+    patience = early_stop_patience
     for epoch in range(epochs):
-        perm = rng.permutation(n)
+        perm = rng.permutation(len(idx_train))
         for it in range(steps_per_epoch):
-            idx = perm[it * batch_size : (it + 1) * batch_size]
-            s_pos = torch.as_tensor(states_n[idx], dtype=torch.float32, device=device)
-            a_pos = torch.as_tensor(a_train[idx], dtype=torch.float32, device=device)
+            idx_loc = perm[it * batch_size : (it + 1) * batch_size]
+            if idx_loc.size == 0:
+                continue
+            idx = idx_train[idx_loc]
+            if len(idx) == 0:
+                continue
+            s_pos_np = states_n[idx]
+            a_pos_np = a_train[idx]
+            s_pos = torch.as_tensor(s_pos_np, dtype=torch.float32, device=device)
+            a_pos = torch.as_tensor(a_pos_np, dtype=torch.float32, device=device)
 
             # generate negatives (same s, random a from broad prior)
             if discrete:
-                neg_idx = np.random.randint(0, action_dim, size=(len(idx), num_negatives))
-                a_neg_np = np.eye(action_dim, dtype=np.float32)[neg_idx]
+                a_neg_np = gen_negatives(s_pos_np, a_pos_np, num_negatives)
             else:
-                low = action_low if action_low is not None else -1.0
-                high = action_high if action_high is not None else 1.0
-                a_neg_np = np.random.rand(len(idx), num_negatives, a_train.shape[1]).astype(np.float32)
-                a_neg_np = a_neg_np * (high - low) + low
-                if action_noise > 0:
-                    a_neg_np = a_neg_np + action_noise * np.random.randn(*a_neg_np.shape).astype(np.float32)
-                # normalize with dataset stats
-                a_neg_np = (a_neg_np - a_mean) / a_std
+                a_neg_np = gen_negatives(s_pos_np, (actions[idx] if not discrete else None), num_negatives)
 
             s_neg = s_pos.repeat_interleave(num_negatives, dim=0)
             a_neg = torch.as_tensor(a_neg_np.reshape(len(idx) * num_negatives, -1), dtype=torch.float32, device=device)
@@ -202,6 +273,37 @@ def train_dsr(
                     p_neg = torch.sigmoid(logits_neg).mean().item()
                 print(f"[DSR] epoch {epoch} it {it} loss {loss.item():.4f} p_pos {p_pos:.3f} p_neg {p_neg:.3f}")
 
+        # validation & early stopping
+        if idx_val is not None:
+            with torch.no_grad():
+                # sample a subset for speed
+                val_bs = min(4096, len(idx_val))
+                sel = rng.choice(idx_val, size=val_bs, replace=False)
+                s_val = torch.as_tensor(states_n[sel], dtype=torch.float32, device=device)
+                if discrete:
+                    a_val = torch.as_tensor(one_hot(actions[sel].astype(np.int64), action_dim), dtype=torch.float32, device=device)
+                else:
+                    a_val = torch.as_tensor((actions[sel] - a_mean) / a_std, dtype=torch.float32, device=device)
+                # negatives for validation
+                a_val_neg_np = gen_negatives(states_n[sel], (actions[sel] if not discrete else None), num_negatives)
+                s_val_neg = s_val.repeat_interleave(num_negatives, dim=0)
+                a_val_neg = torch.as_tensor(a_val_neg_np.reshape(val_bs * num_negatives, -1), dtype=torch.float32, device=device)
+                # compute val loss
+                lp = net(s_val, a_val) / max(temperature, 1e-6)
+                ln = net(s_val_neg, a_val_neg) / max(temperature, 1e-6)
+                val_loss = F.binary_cross_entropy_with_logits(lp, torch.ones_like(lp)) + F.binary_cross_entropy_with_logits(ln, torch.zeros_like(ln))
+                val_l = float(val_loss.item())
+            if val_l < best_val - 1e-6:
+                best_val = val_l
+                best_state = {k: v.cpu().clone() for k, v in net.state_dict().items()}
+                patience = early_stop_patience
+            else:
+                patience -= 1
+            print(f"[DSR] epoch {epoch} val_loss {val_l:.4f} best {best_val:.4f} patience {patience}")
+            if early_stop_patience and patience < 0:
+                print("[DSR] Early stopping due to no val improvement.")
+                break
+
     meta = DSRMetadata(
         state_mean=s_mean,
         state_std=s_std,
@@ -213,8 +315,44 @@ def train_dsr(
         action_low=action_low,
         action_high=action_high,
         temperature=temperature,
+        calib_temperature=1.0,
     )
-    return DSR(net, meta, device=device)
+    dsr = DSR(net, meta, device=device)
+    # restore best weights if early stopping used
+    if best_state is not None:
+        dsr.net.load_state_dict(best_state)
+
+    # Optional post-hoc temperature calibration on validation split
+    if calibrate_temperature and idx_val is not None and len(idx_val) > 0:
+        with torch.no_grad():
+            val_bs = min(10000, len(idx_val))
+            sel = rng.choice(idx_val, size=val_bs, replace=False)
+            s_val = torch.as_tensor(states_n[sel], dtype=torch.float32, device=device)
+            if discrete:
+                a_val = torch.as_tensor(one_hot(actions[sel].astype(np.int64), action_dim), dtype=torch.float32, device=device)
+            else:
+                a_val = torch.as_tensor((actions[sel] - a_mean) / a_std, dtype=torch.float32, device=device)
+            a_val_neg_np = gen_negatives(states_n[sel], (actions[sel] if not discrete else None), num_negatives)
+            s_val_neg = s_val.repeat_interleave(num_negatives, dim=0)
+            a_val_neg = torch.as_tensor(a_val_neg_np.reshape(val_bs * num_negatives, -1), dtype=torch.float32, device=device)
+            # collect logits
+            lp = dsr.net(s_val, a_val)
+            ln = dsr.net(s_val_neg, a_val_neg)
+            y = torch.cat([torch.ones_like(lp), torch.zeros_like(ln)], dim=0)
+            logits = torch.cat([lp, ln], dim=0)
+            # grid-search calibration factor ctemp
+            cands = torch.logspace(np.log10(0.5), np.log10(3.0), steps=21, device=device)
+            best_c = 1.0
+            best_bce = float("inf")
+            for c in cands:
+                bce = F.binary_cross_entropy_with_logits(logits / (temperature * c), y).item()
+                if bce < best_bce:
+                    best_bce = bce
+                    best_c = float(c.item())
+            dsr.meta.calib_temperature = best_c
+            print(f"[DSR] Calibrated temperature factor: {best_c:.3f} (val BCE {best_bce:.4f})")
+
+    return dsr
 
 
 def one_hot(a_idx: np.ndarray, n: int) -> np.ndarray:

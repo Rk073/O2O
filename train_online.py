@@ -109,6 +109,7 @@ def main():
         actor=actor,
         critic=critic,
         dsr=dsr,
+        ref_actor=None,
         discrete=spec.discrete,
         action_dim=spec.action_dim,
         device=device,
