@@ -23,19 +23,21 @@ def main():
     parser.add_argument("--activation", type=str, default="tanh")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=0)
-    # pessimism and bonus
-    parser.add_argument("--pessimism_beta", type=float, default=1.0)
-    parser.add_argument("--pessimism_gamma", type=float, default=1.0)
+    # SW-PPO pessimism knobs
+    parser.add_argument("--pess_alpha0", type=float, default=0.0, help="Initial pessimism coefficient")
+    parser.add_argument("--pess_alpha_final", type=float, default=0.0, help="Final pessimism coefficient")
+    parser.add_argument("--pess_anneal_steps", type=float, default=100000, help="Anneal steps for pessimism")
+    parser.add_argument("--adv_gate_tau", type=float, default=0.5, help="Support threshold for actor gating")
+    parser.add_argument("--adv_gate_k", type=float, default=0.0, help="Steepness of actor gate (0 disables)")
+    # bonus
     parser.add_argument("--bonus_eta", type=float, default=0.1)
     parser.add_argument("--bonus_center", type=float, default=0.7)
     parser.add_argument("--bonus_sigma", type=float, default=0.15)
     parser.add_argument("--bonus_type", type=str, default="boundary", choices=["boundary", "entropy", "ucb"])  # new
-    parser.add_argument("--use_bonus", action="store_true")
     # adaptive knobs
     parser.add_argument("--adaptive_bonus", action="store_true", help="Adapt bonus with performance")
     parser.add_argument("--bonus_alpha", type=float, default=1.0, help="Scale for adaptive bonus")
     parser.add_argument("--target_return", type=float, default=200.0, help="Target return for scaling")
-    parser.add_argument("--dynamic_pessimism", action="store_true", help="Adapt pessimism by support")
     # baselines & init
     parser.add_argument("--no_pessimism", action="store_true")
     parser.add_argument("--no_bonus", action="store_true")
@@ -67,8 +69,16 @@ def main():
         )
     critic = Critic(spec.state_dim, hidden=tuple(args.hidden), activation=args.activation)
 
-    pess_beta = 0.0 if args.no_pessimism else args.pessimism_beta
-    use_bonus = False if args.no_bonus else bool(args.use_bonus)
+    # Configure pessimism knobs (disable if --no_pessimism)
+    if args.no_pessimism:
+        pess_alpha0 = 0.0
+        pess_alpha_final = 0.0
+        adv_gate_k = 0.0  # disables gating
+    else:
+        pess_alpha0 = args.pess_alpha0
+        pess_alpha_final = args.pess_alpha_final
+        adv_gate_k = args.adv_gate_k
+    use_bonus = not args.no_bonus
 
     agent = PPOAgent(
         actor=actor,
@@ -85,8 +95,11 @@ def main():
         ent_coeff=0.0,
         gamma=0.99,
         gae_lambda=0.95,
-        pessimism_beta=pess_beta,
-        pessimism_gamma=args.pessimism_gamma,
+        pess_alpha0=pess_alpha0,
+        pess_alpha_final=pess_alpha_final,
+        pess_anneal_steps=args.pess_anneal_steps,
+        adv_gate_tau=args.adv_gate_tau,
+        adv_gate_k=adv_gate_k,
         bonus_eta=args.bonus_eta,
         bonus_center=args.bonus_center,
         bonus_sigma=args.bonus_sigma,
@@ -133,7 +146,8 @@ def main():
                 "support_mean",
                 "support_p10",
                 "support_p90",
-                "pess_reg",
+                "alpha_pess",
+                "w_actor_mean",
                 "v_mse",
                 "loss_actor",
                 "bonus_used",
@@ -252,14 +266,12 @@ def main():
             "support": np.array(buf["support"], dtype=np.float32),
             "support_std": np.array(buf["support_std"], dtype=np.float32),
         }
-        # dynamic pessimism: decrease as support rises
-        base_beta = pess_beta
-        if args.dynamic_pessimism and batch["support"].size:
-            sup_mean_epoch = float(np.mean(batch["support"]))
-            agent.pessimism_beta = base_beta * max(0.1, 1.0 - sup_mean_epoch)
-        else:
-            agent.pessimism_beta = base_beta
-        metrics = agent.update(batch, minibatch_size=minibatch_size, train_iters=train_iters)
+        metrics = agent.update(
+            batch,
+            minibatch_size=minibatch_size,
+            train_iters=train_iters,
+            current_total_steps=t,
+        )
 
         # clear buffer
         buf = {k: [] for k in buf}
@@ -271,7 +283,8 @@ def main():
         p90 = float(np.percentile(sup, 90)) if sup.size else 0.0
         print(
             f"Steps {t}/{total_steps}  AvgEpRet {avg_ret:.2f}  DSR[mean/p10/p90] {sup_mean:.2f}/{p10:.2f}/{p90:.2f}  "
-            f"pess_reg {metrics['pess_reg']:.4f}  bonus_scale {0.5 * float(np.sqrt(rew_var / max(1.0, rew_cnt - 1.0))):.3f}"
+            f"alpha {metrics.get('alpha_pess', 0.0):.3f}  w_mean {metrics.get('w_actor_mean', 1.0):.3f}  "
+            f"bonus_scale {0.5 * float(np.sqrt(rew_var / max(1.0, rew_cnt - 1.0))):.3f}"
         )
 
         if logger:
@@ -282,7 +295,8 @@ def main():
                     "support_mean": sup_mean,
                     "support_p10": p10,
                     "support_p90": p90,
-                    "pess_reg": metrics.get("pess_reg", 0.0),
+                    "alpha_pess": metrics.get("alpha_pess", 0.0),
+                    "w_actor_mean": metrics.get("w_actor_mean", 0.0),
                     "v_mse": metrics.get("v_mse", 0.0),
                     "loss_actor": metrics.get("loss_actor", 0.0),
                     "bonus_used": bonus,

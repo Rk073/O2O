@@ -108,8 +108,12 @@ class PPOAgent:
     ent_coeff: float
     gamma: float
     gae_lambda: float
-    pessimism_beta: float
-    pessimism_gamma: float
+    # --- SW-PPO knobs ---
+    pess_alpha0: float              # Initial pessimism coefficient
+    pess_alpha_final: float         # Final pessimism coefficient
+    pess_anneal_steps: float        # Steps to anneal pessimism over
+    adv_gate_tau: float             # Support threshold for actor gating
+    adv_gate_k: float               # Steepness of actor gate
     bonus_eta: float
     bonus_center: float
     bonus_sigma: float
@@ -143,24 +147,27 @@ class PPOAgent:
         ret = adv + values[:-1]
         return adv, ret
 
-    def update(self, buf: dict, minibatch_size: int, train_iters: int):
+    def update(self, buf: dict, minibatch_size: int, train_iters: int, current_total_steps: int):
         obs = torch.as_tensor(buf["obs"], dtype=torch.float32, device=self.device)
         act = torch.as_tensor(buf["act"], dtype=torch.float32 if not self.discrete else torch.long, device=self.device)
         adv = torch.as_tensor(buf["adv"], dtype=torch.float32, device=self.device)
         ret = torch.as_tensor(buf["ret"], dtype=torch.float32, device=self.device)
         logp_old = torch.as_tensor(buf["logp"], dtype=torch.float32, device=self.device)
         support = torch.as_tensor(buf["support"], dtype=torch.float32, device=self.device)
-        support_std = torch.as_tensor(
-            buf.get("support_std", np.zeros_like(buf["support"])),
-            dtype=torch.float32,
-            device=self.device,
-        )
 
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
+        # Compute pessimism alpha (annealed) and actor gate weights
+        with torch.no_grad():
+            frac = max(0.0, 1.0 - (float(current_total_steps) / max(1.0, float(self.pess_anneal_steps))))
+            alpha = self.pess_alpha_final + (self.pess_alpha0 - self.pess_alpha_final) * frac
+            if self.adv_gate_k is not None and self.adv_gate_k > 0:
+                w = torch.sigmoid(self.adv_gate_k * (support - self.adv_gate_tau))
+            else:
+                w = torch.ones_like(support)
+
         n = obs.shape[0]
         idxs = np.arange(n)
-        avg_pess_reg = 0.0
         avg_v_mse = 0.0
         avg_loss_actor = 0.0
         count = 0
@@ -168,28 +175,25 @@ class PPOAgent:
             np.random.shuffle(idxs)
             for start in range(0, n, minibatch_size):
                 mb = idxs[start : start + minibatch_size]
-                # Actor loss
+                # Actor loss with gated advantages by DSR support
                 dist = self.actor(obs[mb])
                 logp = dist.log_prob(act[mb])
                 ratio = torch.exp(logp - logp_old[mb])
-                clip_adv = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * adv[mb]
-                loss_actor = -(torch.min(ratio * adv[mb], clip_adv)).mean()
+                adv_gated = adv[mb] * w[mb]
+                clip_adv = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * adv_gated
+                loss_actor = -(torch.min(ratio * adv_gated, clip_adv)).mean()
                 ent = dist.entropy().mean()
 
                 self.opt_actor.zero_grad()
                 (loss_actor - self.ent_coeff * ent).backward()
                 self.opt_actor.step()
 
-                # Critic loss with overestimation-only pessimism and LCB weighting
+                # Critic loss with pessimistic value targets
                 v = self.critic(obs[mb])
-                mse = F.mse_loss(v, ret[mb])
-                # Lower confidence bound gate
-                lcbs = (support[mb] - 2.0 * support_std[mb]).clamp(0.0, 1.0)
-                # penalize only over-estimation
-                over = F.relu(v - ret[mb])
-                pess_w = (1.0 - lcbs).pow(self.pessimism_gamma)
-                pess_reg = (pess_w * over.pow(2)).mean()
-                loss_critic = self.vf_coeff * mse + self.pessimism_beta * pess_reg
+                with torch.no_grad():
+                    value_target = ret[mb] - alpha * (1.0 - support[mb])
+                mse = F.mse_loss(v, value_target)
+                loss_critic = self.vf_coeff * mse
 
                 self.opt_critic.zero_grad()
                 loss_critic.backward()
@@ -197,19 +201,18 @@ class PPOAgent:
 
                 # accum metrics
                 bs = len(mb)
-                avg_pess_reg += pess_reg.detach().item() * bs
                 avg_v_mse += mse.detach().item() * bs
                 avg_loss_actor += loss_actor.detach().item() * bs
                 count += bs
 
         if count > 0:
-            avg_pess_reg /= count
             avg_v_mse /= count
             avg_loss_actor /= count
         return {
-            "pess_reg": avg_pess_reg,
             "v_mse": avg_v_mse,
             "loss_actor": avg_loss_actor,
+            "alpha_pess": float(alpha),
+            "w_actor_mean": float(w.mean().item()),
         }
 
     def evaluate_value(self, obs: np.ndarray) -> float:
