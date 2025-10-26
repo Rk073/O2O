@@ -23,6 +23,9 @@ def main():
     parser.add_argument("--activation", type=str, default="tanh")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=0)
+    # Observation normalization (PPO only)
+    parser.add_argument("--obs_norm", action="store_true")
+    parser.add_argument("--obs_norm_clip", type=float, default=10.0)
     # SW-PPO pessimism knobs
     parser.add_argument("--pess_alpha0", type=float, default=0.0, help="Initial pessimism coefficient")
     parser.add_argument("--pess_alpha_final", type=float, default=0.0, help="Final pessimism coefficient")
@@ -43,6 +46,19 @@ def main():
     parser.add_argument("--no_pessimism", action="store_true")
     parser.add_argument("--no_bonus", action="store_true")
     parser.add_argument("--init_actor", type=str, default=None, help="Path to actor weights (BC pretrain)")
+    # PPO stability + trust-region
+    parser.add_argument("--ent_coeff", type=float, default=0.0)
+    parser.add_argument("--target_kl", type=float, default=0.01)
+    parser.add_argument("--vf_clip", type=float, default=0.0, help="Value clip (0 disables)")
+    parser.add_argument("--actor_grad_clip", type=float, default=0.0)
+    parser.add_argument("--critic_grad_clip", type=float, default=0.0)
+    parser.add_argument("--support_adaptive_clip", action="store_true")
+    # BC anchor schedule
+    parser.add_argument("--kl_bc_coef", type=float, default=0.0, help="Fixed BC anchor (if no schedule)")
+    parser.add_argument("--kl_bc_pow", type=float, default=1.0)
+    parser.add_argument("--kl_bc_coef0", type=float, default=0.0)
+    parser.add_argument("--kl_bc_coef_final", type=float, default=0.0)
+    parser.add_argument("--kl_bc_anneal_steps", type=float, default=0.0)
     # early stopping and logging
     parser.add_argument("--early_stop_avg_return", type=float, default=None)
     parser.add_argument("--early_stop_window", type=int, default=10)
@@ -105,20 +121,37 @@ def main():
         adv_gate_k = args.adv_gate_k
     use_bonus = not args.no_bonus
 
+    # Set up a frozen reference actor (BC) for KL anchor if requested
+    ref_actor = None
+    if args.init_actor:
+        if spec.discrete:
+            ref_actor = ActorDiscrete(spec.state_dim, spec.action_dim, hidden=hidden_actor, activation=args.activation)
+        else:
+            ref_actor = ActorGaussian(
+                spec.state_dim,
+                spec.action_dim,
+                action_low=np.array(spec.action_low_vec, dtype=np.float32),
+                action_high=np.array(spec.action_high_vec, dtype=np.float32),
+                hidden=hidden_actor,
+                activation=args.activation,
+            )
+        sd_ref = torch.load(args.init_actor, map_location=device)
+        ref_actor.load_state_dict(sd_ref)
+
     agent = PPOAgent(
         actor=actor,
         critic=critic,
         dsr=dsr,
-        ref_actor=None,
+        ref_actor=ref_actor,
         discrete=spec.discrete,
         action_dim=spec.action_dim,
         device=device,
         lr_actor=3e-4,
         lr_critic=3e-4,
         clip_ratio=0.2,
-        target_kl=0.01,
+        target_kl=args.target_kl,
         vf_coeff=0.5,
-        ent_coeff=0.0,
+        ent_coeff=args.ent_coeff,
         gamma=0.99,
         gae_lambda=0.95,
         pess_alpha0=pess_alpha0,
@@ -132,6 +165,15 @@ def main():
         bonus_sigma=args.bonus_sigma,
         use_bonus=use_bonus,
         bonus_type=args.bonus_type,
+        kl_bc_coef=args.kl_bc_coef,
+        kl_bc_pow=args.kl_bc_pow,
+        kl_bc_coef0=args.kl_bc_coef0,
+        kl_bc_coef_final=args.kl_bc_coef_final,
+        kl_bc_anneal_steps=args.kl_bc_anneal_steps,
+        actor_grad_clip=(args.actor_grad_clip if args.actor_grad_clip > 0 else None),
+        critic_grad_clip=(args.critic_grad_clip if args.critic_grad_clip > 0 else None),
+        vf_clip=(args.vf_clip if args.vf_clip > 0 else None),
+        support_adaptive_clip=bool(args.support_adaptive_clip),
     )
 
     # optional init from BC
@@ -187,6 +229,35 @@ def main():
     minibatch_size = args.minibatch_size
     train_iters = args.train_iters
 
+    # Observation normalization for PPO (DSR uses raw obs)
+    class RunningNorm:
+        def __init__(self, shape: int, clip: float = 10.0):
+            self.mean = np.zeros((shape,), dtype=np.float32)
+            self.M2 = np.ones((shape,), dtype=np.float32)
+            self.count = 1e-4
+            self.clip = float(clip)
+        def update(self, x: np.ndarray):
+            x = np.asarray(x, dtype=np.float32)
+            delta = x - self.mean
+            self.count += 1.0
+            self.mean += delta / self.count
+            delta2 = x - self.mean
+            self.M2 += delta * delta2
+        def std(self):
+            return np.sqrt(self.M2 / max(1.0, self.count - 1.0))
+        def normalize(self, x: np.ndarray):
+            x = np.asarray(x, dtype=np.float32)
+            s = self.std()
+            x_n = (x - self.mean) / (s + 1e-8)
+            return np.clip(x_n, -self.clip, self.clip)
+
+    obs_rn = RunningNorm(spec.state_dim, clip=args.obs_norm_clip) if args.obs_norm else None
+    if obs_rn is not None:
+        obs_rn.update(obs)
+        obs_p = obs_rn.normalize(obs)
+    else:
+        obs_p = obs
+
     buf = {k: [] for k in ["obs", "act", "rew", "val", "logp", "done", "support", "support_std"]}
     t = 0
     while t < total_steps:
@@ -199,7 +270,14 @@ def main():
                 ep_ret, ep_len = 0.0, 0
                 continue
 
-            a, logp, ent = agent.select_action(obs)
+            # normalize obs for PPO
+            if obs_rn is not None:
+                obs_rn.update(obs)
+                obs_p = obs_rn.normalize(obs)
+            else:
+                obs_p = obs
+
+            a, logp, ent = agent.select_action(obs_p)
             # guard invalid actions and clip to bounds for Box spaces
             if not spec.discrete:
                 low = np.array(spec.action_low_vec, dtype=np.float32)
@@ -270,8 +348,8 @@ def main():
             bonus = float(np.clip(bonus, 0.0, 0.5 * max(1e-6, rew_std)))
             r_total = float(r + bonus)
 
-            v = agent.evaluate_value(obs)
-            buf["obs"].append(obs)
+            v = agent.evaluate_value(obs_p)
+            buf["obs"].append(obs_p)
             buf["act"].append(a)
             buf["rew"].append(r_total)
             buf["val"].append(v)
@@ -305,7 +383,12 @@ def main():
                 break
 
         # compute GAE advantages
-        last_val = agent.evaluate_value(obs)
+        # bootstrap value from normalized obs
+        if obs_rn is not None:
+            obs_p = obs_rn.normalize(obs)
+        else:
+            obs_p = obs
+        last_val = agent.evaluate_value(obs_p)
         rewards = np.array(buf["rew"], dtype=np.float32)
         values = np.array(buf["val"], dtype=np.float32)
         dones = np.array(buf["done"], dtype=np.float32)
@@ -321,6 +404,7 @@ def main():
             "logp": np.array(buf["logp"], dtype=np.float32),
             "support": np.array(buf["support"], dtype=np.float32),
             "support_std": np.array(buf["support_std"], dtype=np.float32),
+            "v_old": np.array(buf["val"], dtype=np.float32),
         }
         # filter out any rows with non-finite values to avoid NaNs in updates
         mask = np.isfinite(batch["obs"]).all(axis=1)
