@@ -54,8 +54,31 @@ def main():
     spec = get_space_spec(env)
     dsr = DSR.load(args.dsr_path, device=device)
 
+    # Determine actor hidden sizes; if init_actor is provided and shapes differ,
+    # infer hidden sizes from checkpoint to avoid size mismatch.
+    hidden_actor = tuple(args.hidden)
+    if args.init_actor:
+        try:
+            sd_probe = torch.load(args.init_actor, map_location="cpu")
+            if isinstance(sd_probe, dict):
+                w_items = []
+                for k, v in sd_probe.items():
+                    if k.startswith("net.") and k.endswith(".weight") and hasattr(v, "shape"):
+                        parts = k.split(".")
+                        if len(parts) >= 3 and parts[1].isdigit():
+                            w_items.append((int(parts[1]), tuple(v.shape)))
+                if w_items:
+                    w_items.sort(key=lambda x: x[0])
+                    # hidden sizes are out_features of all but last layer
+                    hidden_from_sd = tuple(int(s[0]) for _, s in w_items[:-1])
+                    if hidden_from_sd and hidden_from_sd != hidden_actor:
+                        hidden_actor = hidden_from_sd
+                        print(f"[train_online] Overriding actor hidden sizes to {hidden_actor} to match init_actor")
+        except Exception as e:
+            print(f"[train_online] Warning: could not inspect init_actor: {e}")
+
     if spec.discrete:
-        actor = ActorDiscrete(spec.state_dim, spec.action_dim, hidden=tuple(args.hidden), activation=args.activation)
+        actor = ActorDiscrete(spec.state_dim, spec.action_dim, hidden=hidden_actor, activation=args.activation)
     else:
         low = np.array(spec.action_low_vec, dtype=np.float32)
         high = np.array(spec.action_high_vec, dtype=np.float32)
@@ -64,9 +87,10 @@ def main():
             spec.action_dim,
             action_low=low,
             action_high=high,
-            hidden=tuple(args.hidden),
+            hidden=hidden_actor,
             activation=args.activation,
         )
+    # Allow critic to use the user-provided hidden sizes independently
     critic = Critic(spec.state_dim, hidden=tuple(args.hidden), activation=args.activation)
 
     # Configure pessimism knobs (disable if --no_pessimism)
