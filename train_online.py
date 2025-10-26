@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--pess_alpha0", type=float, default=0.0, help="Initial pessimism coefficient")
     parser.add_argument("--pess_alpha_final", type=float, default=0.0, help="Final pessimism coefficient")
     parser.add_argument("--pess_anneal_steps", type=float, default=100000, help="Anneal steps for pessimism")
+    parser.add_argument("--pess_gamma", type=float, default=1.0, help="Exponent for inverse-support in pessimism")
     parser.add_argument("--adv_gate_tau", type=float, default=0.5, help="Support threshold for actor gating")
     parser.add_argument("--adv_gate_k", type=float, default=0.0, help="Steepness of actor gate (0 disables)")
     # bonus
@@ -122,6 +123,7 @@ def main():
         pess_alpha0=pess_alpha0,
         pess_alpha_final=pess_alpha_final,
         pess_anneal_steps=args.pess_anneal_steps,
+        pess_gamma=args.pess_gamma,
         adv_gate_tau=args.adv_gate_tau,
         adv_gate_k=adv_gate_k,
         bonus_eta=args.bonus_eta,
@@ -189,7 +191,29 @@ def main():
     while t < total_steps:
         # collect rollout
         for _ in range(steps_per_epoch):
+            # if observation is invalid, reset episode to avoid NaNs propagating
+            if not np.all(np.isfinite(obs)):
+                reset_out = env.reset()
+                obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
+                ep_ret, ep_len = 0.0, 0
+                continue
+
             a, logp, ent = agent.select_action(obs)
+            # guard invalid actions and clip to bounds for Box spaces
+            if not spec.discrete:
+                low = np.array(spec.action_low_vec, dtype=np.float32)
+                high = np.array(spec.action_high_vec, dtype=np.float32)
+                if isinstance(a, np.ndarray):
+                    if not np.all(np.isfinite(a)):
+                        a = np.zeros_like(a, dtype=np.float32)
+                    a = np.clip(a, low, high)
+                else:
+                    if not np.isfinite(a):
+                        a = 0.0
+                    a = float(np.clip(a, low, high))
+            else:
+                if not np.isfinite(a):
+                    a = int(0)
             step_out = env.step(a)
             if len(step_out) == 5:
                 next_obs, r, done, truncated, _ = step_out
@@ -262,7 +286,14 @@ def main():
             ep_len += 1
             t += 1
 
-            obs = next_obs
+            # If next_obs is invalid, treat as episode end and reset
+            if not np.all(np.isfinite(next_obs)):
+                ep_returns.append(ep_ret)
+                reset_out = env.reset()
+                obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
+                ep_ret, ep_len = 0.0, 0
+            else:
+                obs = next_obs
             if done or truncated:
                 ep_returns.append(ep_ret)
                 reset_out = env.reset()
@@ -290,6 +321,21 @@ def main():
             "support": np.array(buf["support"], dtype=np.float32),
             "support_std": np.array(buf["support_std"], dtype=np.float32),
         }
+        # filter out any rows with non-finite values to avoid NaNs in updates
+        mask = np.isfinite(batch["obs"]).all(axis=1)
+        mask &= np.isfinite(batch["ret"]) & np.isfinite(batch["adv"]) & np.isfinite(batch["logp"]) & np.isfinite(batch["support"])
+        if not spec.discrete:
+            mask &= np.isfinite(batch["act"]).all(axis=-1)
+        else:
+            mask &= np.isfinite(batch["act"]).astype(bool)
+        if mask.sum() < len(mask):
+            for k in list(batch.keys()):
+                batch[k] = batch[k][mask]
+            print(f"[train_online] Dropped {int((~mask).sum())} invalid samples before update")
+        if batch["obs"].size == 0:
+            print("[train_online] Warning: no valid samples this epoch; skipping update")
+            buf = {k: [] for k in buf}
+            continue
         metrics = agent.update(
             batch,
             minibatch_size=minibatch_size,

@@ -112,6 +112,7 @@ class PPOAgent:
     pess_alpha0: float              # Initial pessimism coefficient
     pess_alpha_final: float         # Final pessimism coefficient
     pess_anneal_steps: float        # Steps to anneal pessimism over
+    pess_gamma: float               # Exponent for (1 - support)^gamma
     adv_gate_tau: float             # Support threshold for actor gating
     adv_gate_k: float               # Steepness of actor gate
     bonus_eta: float
@@ -191,7 +192,11 @@ class PPOAgent:
                 # Critic loss with pessimistic value targets
                 v = self.critic(obs[mb])
                 with torch.no_grad():
-                    value_target = ret[mb] - alpha * (1.0 - support[mb])
+                    # Pessimistic shaping scaled by inverse-support with exponent
+                    inv_sup = torch.clamp(1.0 - support[mb], 0.0, 1.0)
+                    if self.pess_gamma is not None and self.pess_gamma != 1.0:
+                        inv_sup = torch.pow(inv_sup, self.pess_gamma)
+                    value_target = ret[mb] - alpha * inv_sup
                 mse = F.mse_loss(v, value_target)
                 loss_critic = self.vf_coeff * mse
 

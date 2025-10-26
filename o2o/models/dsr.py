@@ -81,7 +81,23 @@ class DSR:
         # weights_only=False to allow loading metadata dict with numpy arrays (trusted local file)
         chk = torch.load(path, map_location=device, weights_only=False)
         meta = DSRMetadata(**chk["meta"])
-        net = DSRNet(meta.state_dim, meta.action_dim)
+        # Infer hidden sizes from checkpoint if possible (for compatibility with varied configs)
+        hidden = None
+        try:
+            w_keys = [(k, v) for k, v in chk["model"].items() if k.startswith("net.") and k.endswith(".weight")]
+            # sort by layer index (net.0, net.2, ...)
+            def layer_idx(k):
+                parts = k.split(".")
+                return int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            w_keys.sort(key=lambda kv: layer_idx(kv[0]))
+            outs = [int(w.shape[0]) for _, w in w_keys]
+            if len(outs) >= 2:
+                hidden = tuple(outs[:-1])  # exclude final output layer
+        except Exception:
+            hidden = None
+        if hidden is None or len(hidden) == 0:
+            hidden = (256, 256)
+        net = DSRNet(meta.state_dim, meta.action_dim, hidden=hidden)
         net.load_state_dict(chk["model"])
         return DSR(net, meta, device=device)
 
@@ -105,8 +121,15 @@ def train_dsr(
     log_every: int = 100,
     weight_decay: float = 0.0,
     grad_clip: float | None = None,
+    seed: int | None = None,
 ) -> DSR:
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(seed)
+    try:
+        import torch
+        if seed is not None:
+            torch.manual_seed(int(seed))
+    except Exception:
+        pass
     n = states.shape[0]
     state_dim = states.shape[1]
     action_raw = actions

@@ -16,6 +16,7 @@ def main():
     parser.add_argument("--env_id", type=str, required=True)
     parser.add_argument("--dsr_out", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--hidden", type=int, nargs="*", default=[256, 256])
@@ -51,6 +52,7 @@ def main():
         temperature=args.temperature,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
+        seed=args.seed,
     )
 
     os.makedirs(os.path.dirname(args.dsr_out), exist_ok=True)
