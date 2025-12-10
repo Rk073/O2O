@@ -331,11 +331,11 @@ def main():
             if done or truncated:
                 # Prevent value bleed across episodes: treat truncation as terminal for advantages
                 if truncated and len(buf["done"]) > 0:
-                    buf["done"][-1] = 1.0
-                ep_returns.append(ep_ret)
-                obs = env.reset()[0]
-                obs_p = get_obs_p(obs)
-                ep_ret, ep_len = 0.0, 0
+                   
+                    ep_returns.append(ep_ret)
+                    obs = env.reset()[0]
+                    obs_p = get_obs_p(obs)
+                    ep_ret, ep_len = 0.0, 0
 
             if t >= args.total_steps:
                 break
