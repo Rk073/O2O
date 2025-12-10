@@ -215,8 +215,8 @@ class PPOAgent:
                 # Asymmetric Advantage Gating:
                 # Gate positive advantages (don't overfit to OOD luck)
                 # Pass negative advantages fully (learn from OOD mistakes)
-                adv_mb = adv[mb]
-                adv_gated = torch.where(adv_mb > 0, adv_mb * w[mb], adv_mb)
+                w = torch.sigmoid(self.adv_gate_k * (support - tau))
+                adv_gated = torch.where(adv[mb] > 0, adv[mb] * w[mb], adv[mb])
                 
                 # Normalize after gating for stability
                 if adv_gated.std() > 1e-8:

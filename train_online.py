@@ -150,8 +150,11 @@ def main():
     )
 
     if args.init_actor:
-        sd = torch.load(args.init_actor, map_location=device)
-        agent.actor.load_state_dict(sd)
+        agent.actor.load_state_dict(torch.load(args.init_actor))
+        print("Resetting Actor LogStd for Online Exploration...")
+        with torch.no_grad():
+            # Set log_std to -0.5 (approx 0.6 std dev) to allow exploration
+            agent.actor.log_std.fill_(-0.5)
 
     # Observation Normalization for PPO only
     class RunningNorm:
@@ -293,7 +296,10 @@ def main():
             pess_penalty = pess_alpha * inv_sup
             
             # PROFESSOR FIX: Modify return directly, do not hack value target
-            r_total = float(r + bonus - pess_penalty)
+            
+            # Scale rewards down by 100x or 10x for HalfCheetah to keep values small (~1.0)
+            reward_scale = 0.05 
+            r_total = float((r + bonus - pess_penalty) * reward_scale)
 
             v = agent.evaluate_value(obs_p)
             buf["obs"].append(obs_p)
