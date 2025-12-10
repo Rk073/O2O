@@ -46,7 +46,6 @@ class ActorGaussian(nn.Module):
 
     def forward(self, s: torch.Tensor):
         mu = self.net(s)
-        # clamp log_std to avoid degenerate variances in high-dimensional action spaces
         std = torch.exp(self.log_std.clamp(min=-5.0, max=2.0))
         base = torch.distributions.Independent(torch.distributions.Normal(mu, std), 1)
         return TanhTransformedDist(base, self.act_scale, self.act_bias)
@@ -73,7 +72,6 @@ class TanhTransformedDist(torch.distributions.Distribution):
         return self.sample()
 
     def log_prob(self, value):
-        # inverse tanh-scaling
         a = (value - self.bias) / (self.scale + 1e-8)
         a = a.clamp(-0.999999, 0.999999)
         z = 0.5 * (torch.log1p(a) - torch.log1p(-a))  # atanh
@@ -81,7 +79,6 @@ class TanhTransformedDist(torch.distributions.Distribution):
         return log_prob
 
     def entropy(self):
-        # approx entropy via unsquashed entropy (common shortcut)
         return self.base_dist.base_dist.entropy().sum(-1)
 
 
@@ -111,25 +108,22 @@ class PPOAgent:
     ent_coeff: float
     gamma: float
     gae_lambda: float
-    # --- SW-PPO knobs ---
-    pess_alpha0: float              # Initial pessimism coefficient
-    pess_alpha_final: float         # Final pessimism coefficient
-    pess_anneal_steps: float        # Steps to anneal pessimism over
-    pess_gamma: float               # Exponent for (1 - support)^gamma
-    adv_gate_tau: float             # Support threshold for actor gating
-    adv_gate_k: float               # Steepness of actor gate
+    pess_alpha0: float
+    pess_alpha_final: float
+    pess_anneal_steps: float
+    pess_gamma: float
+    adv_gate_tau: float
+    adv_gate_k: float
     bonus_eta: float
     bonus_center: float
     bonus_sigma: float
     use_bonus: bool
-    bonus_type: str = "boundary"  # one of: boundary, entropy, ucb
-    # BC-anchored KL regularization (stabilize policy in low-support regions)
+    bonus_type: str = "boundary"
     kl_bc_coef: float = 0.0
     kl_bc_pow: float = 1.0
     kl_bc_coef0: float = 0.0
     kl_bc_coef_final: float = 0.0
     kl_bc_anneal_steps: float = 0.0
-    # Stabilization
     actor_grad_clip: float | None = None
     critic_grad_clip: float | None = None
     vf_clip: float | None = None
@@ -171,6 +165,12 @@ class PPOAgent:
         ret = adv + values[:-1]
         return adv, ret
 
+    def get_pessimism_alpha(self, current_total_steps: int) -> float:
+        """Calculate current pessimism coefficient based on anneal schedule."""
+        frac = max(0.0, 1.0 - (float(current_total_steps) / max(1.0, float(self.pess_anneal_steps))))
+        alpha = self.pess_alpha_final + (self.pess_alpha0 - self.pess_alpha_final) * frac
+        return alpha
+
     def update(self, buf: dict, minibatch_size: int, train_iters: int, current_total_steps: int):
         obs = torch.as_tensor(buf["obs"], dtype=torch.float32, device=self.device)
         act = torch.as_tensor(buf["act"], dtype=torch.float32 if not self.discrete else torch.long, device=self.device)
@@ -181,11 +181,8 @@ class PPOAgent:
 
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        # Compute pessimism alpha (annealed) and actor gate weights
+        # Gate weights
         with torch.no_grad():
-            frac = max(0.0, 1.0 - (float(current_total_steps) / max(1.0, float(self.pess_anneal_steps))))
-            alpha = self.pess_alpha_final + (self.pess_alpha0 - self.pess_alpha_final) * frac
-            # anneal adv_gate_tau if schedule provided
             tau = self.adv_gate_tau
             if self.adv_gate_tau0 is not None and self.adv_gate_tau_final is not None and self.adv_gate_tau_anneal_steps is not None and self.adv_gate_tau_anneal_steps > 0:
                 frac_tau = max(0.0, 1.0 - (float(current_total_steps) / float(self.adv_gate_tau_anneal_steps)))
@@ -204,68 +201,67 @@ class PPOAgent:
         kl_count = 0
         early_stop = False
         bc_alpha_value = 0.0
+        
         for _ in range(train_iters):
             np.random.shuffle(idxs)
             for start in range(0, n, minibatch_size):
                 mb = idxs[start : start + minibatch_size]
-                # Actor loss with gated advantages by DSR support
+                
+                # Actor Update
                 dist = self.actor(obs[mb])
                 logp = dist.log_prob(act[mb])
                 ratio = torch.exp(logp - logp_old[mb])
+                
                 adv_gated = adv[mb] * w[mb]
-                # re-normalize after gating to stabilize scale
                 adv_gated = (adv_gated - adv_gated.mean()) / (adv_gated.std() + 1e-8)
+                
                 if self.support_adaptive_clip:
-                    # reduce clip range in low-support regions
                     coef = 0.5 + 0.5 * w[mb]
                     clip_low = 1 - self.clip_ratio * coef
                     clip_high = 1 + self.clip_ratio * coef
                     clip_adv = torch.clamp(ratio, clip_low, clip_high) * adv_gated
                 else:
                     clip_adv = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * adv_gated
+                
                 ppo_obj = torch.min(ratio * adv_gated, clip_adv)
                 loss_actor = -(ppo_obj).mean()
-                # Support-weighted BC anchor: encourage actions to be likely under frozen BC policy
+
+                # BC Anchor
                 if self.kl_bc_coef is not None and self.kl_bc_coef > 0 and self.ref_actor is not None:
-                    # schedule KL-BC coefficient
                     if self.kl_bc_anneal_steps is not None and self.kl_bc_anneal_steps > 0:
                         frac_bc = max(0.0, 1.0 - (float(current_total_steps) / max(1.0, float(self.kl_bc_anneal_steps))))
                         bc_alpha = self.kl_bc_coef_final + (self.kl_bc_coef0 - self.kl_bc_coef_final) * frac_bc
                     else:
                         bc_alpha = self.kl_bc_coef
+                    
                     with torch.no_grad():
                         w_bc = torch.clamp(1.0 - support[mb], 0.0, 1.0)
                         if self.kl_bc_pow is not None and self.kl_bc_pow != 1.0:
                             w_bc = torch.pow(w_bc, self.kl_bc_pow)
-                        if self.adv_gate_uncert_kappa is not None and self.adv_gate_uncert_kappa > 0:
-                            std_arr = None
-                            # try to read std if provided in buffer (optional)
-                            # handled below in reading buf tensors
+                    
                     dist_ref = self.ref_actor(obs[mb])
                     logp_ref = dist_ref.log_prob(act[mb])
-                    # minimize -logp_ref (i.e., maximize ref likelihood of current actions)
                     bc_reg = -(w_bc * logp_ref).mean()
                     loss_actor = loss_actor + bc_alpha * bc_reg
                     bc_alpha_value = float(bc_alpha)
+                
                 ent = dist.entropy().mean()
-
+                
                 self.opt_actor.zero_grad()
                 (loss_actor - self.ent_coeff * ent).backward()
                 if self.actor_grad_clip is not None and self.actor_grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.actor_grad_clip)
                 self.opt_actor.step()
 
-                # Critic loss with pessimistic value targets
+                # Critic Update (Pessimism applied to rewards via 'ret', not value target shaping)
                 v = self.critic(obs[mb])
+                # Target is just return (which now includes pessimism penalty)
+                value_target = ret[mb]
+                
                 v_old_mb = None
                 if 'v_old' in buf:
                     v_old_mb = torch.as_tensor(buf['v_old'][mb], dtype=torch.float32, device=self.device)
-                with torch.no_grad():
-                    # Pessimistic shaping scaled by inverse-support with exponent
-                    inv_sup = torch.clamp(1.0 - support[mb], 0.0, 1.0)
-                    if self.pess_gamma is not None and self.pess_gamma != 1.0:
-                        inv_sup = torch.pow(inv_sup, self.pess_gamma)
-                    value_target = ret[mb] - alpha * inv_sup
+                
                 if self.vf_clip is not None and self.vf_clip > 0 and v_old_mb is not None:
                     v_clipped = v_old_mb + (v - v_old_mb).clamp(-self.vf_clip, self.vf_clip)
                     mse_unclipped = (v - value_target) ** 2
@@ -281,7 +277,7 @@ class PPOAgent:
                     torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.critic_grad_clip)
                 self.opt_critic.step()
 
-                # Approximate KL for early stopping
+                # KL Check
                 with torch.no_grad():
                     kl = (logp_old[mb] - logp).mean().abs().item()
                     approx_kl_mean += kl * len(mb)
@@ -290,7 +286,6 @@ class PPOAgent:
                         early_stop = True
                         break
 
-                # accum metrics
                 bs = len(mb)
                 avg_v_mse += mse.detach().item() * bs
                 avg_loss_actor += loss_actor.detach().item() * bs
@@ -306,7 +301,7 @@ class PPOAgent:
         return {
             "v_mse": avg_v_mse,
             "loss_actor": avg_loss_actor,
-            "alpha_pess": float(alpha),
+            "alpha_pess": self.get_pessimism_alpha(current_total_steps), # just for logging
             "w_actor_mean": float(w.mean().item()),
             "approx_kl": float(approx_kl_mean),
             "early_stop": bool(early_stop),
