@@ -25,9 +25,44 @@ def main():
     parser.add_argument("--entropy_coeff", type=float, default=0.01, help="Entropy regularization for discrete")
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--use_cosine", action="store_true", help="Use cosine LR schedule")
+    parser.add_argument("--wandb", action="store_true", help="Log training to Weights & Biases")
+    parser.add_argument("--wandb_project", type=str, default="o2o")
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_group", type=str, default=None)
+    parser.add_argument("--wandb_tags", type=str, nargs="*", default=None)
+    parser.add_argument("--wandb_mode", type=str, default=None, choices=["online", "offline", "disabled"])
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu"
+    wandb_run = None
+    wandb_mod = None
+    if args.wandb:
+        try:
+            import wandb as _wandb
+
+            wandb_mod = _wandb
+            wandb_run = wandb_mod.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                group=args.wandb_group,
+                tags=args.wandb_tags,
+                mode=args.wandb_mode,
+                config={
+                    "env_id": args.env_id,
+                    "epochs": args.epochs,
+                    "batch_size": args.batch_size,
+                    "hidden": args.hidden,
+                    "activation": args.activation,
+                    "lr": args.lr,
+                    "entropy_coeff": args.entropy_coeff,
+                    "grad_clip": args.grad_clip,
+                    "use_cosine": args.use_cosine,
+                    "offline_path": args.offline_path,
+                },
+            )
+        except Exception as e:
+            print(f"[wandb] init failed, continuing without wandb: {e}")
+            wandb_run = None
     data = load_npz_dataset(args.offline_path)
     env = make_env(args.env_id)
     spec = get_space_spec(env)
@@ -89,13 +124,27 @@ def main():
             total_loss += loss.item() * s.shape[0]
         if scheduler is not None:
             scheduler.step()
-        print(f"[BC] epoch {epoch} loss {total_loss / N:.4f}")
+        epoch_loss = total_loss / N
+        print(f"[BC] epoch {epoch} loss {epoch_loss:.4f}")
+        if wandb_run:
+            wandb_mod.log(
+                {"bc/epoch": epoch, "bc/loss": float(epoch_loss), "bc/lr": opt.param_groups[0]["lr"]},
+                step=epoch,
+            )
 
     dirn = os.path.dirname(args.out_actor)
     if dirn:
         os.makedirs(dirn, exist_ok=True)
     torch.save(actor.state_dict(), args.out_actor)
     print(f"Saved BC actor to {args.out_actor}")
+    if wandb_run:
+        try:
+            art = wandb_mod.Artifact(f"bc-actor-{args.env_id}".replace("/", "-"), type="model")
+            art.add_file(args.out_actor)
+            wandb_run.log_artifact(art)
+        except Exception as e:
+            print(f"[wandb] artifact log failed: {e}")
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

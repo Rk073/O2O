@@ -63,9 +63,70 @@ def main():
     parser.add_argument("--early_stop_avg_return", type=float, default=None)
     parser.add_argument("--early_stop_window", type=int, default=10)
     parser.add_argument("--log_csv", type=str, default=None, help="logs/run.csv if set")
+    parser.add_argument("--wandb", action="store_true", help="Log training to Weights & Biases")
+    parser.add_argument("--wandb_project", type=str, default="o2o")
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_group", type=str, default=None)
+    parser.add_argument("--wandb_tags", type=str, nargs="*", default=None)
+    parser.add_argument("--wandb_mode", type=str, default=None, choices=["online", "offline", "disabled"])
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu"
+    wandb_run = None
+    wandb_mod = None
+    if args.wandb:
+        try:
+            import wandb as _wandb
+
+            wandb_mod = _wandb
+            wandb_run = wandb_mod.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                group=args.wandb_group,
+                tags=args.wandb_tags,
+                mode=args.wandb_mode,
+                config={
+                    "env_id": args.env_id,
+                    "dsr_path": args.dsr_path,
+                    "total_steps": args.total_steps,
+                    "steps_per_epoch": args.steps_per_epoch,
+                    "minibatch_size": args.minibatch_size,
+                    "train_iters": args.train_iters,
+                    "hidden": args.hidden,
+                    "activation": args.activation,
+                    "obs_norm": args.obs_norm,
+                    "pess_alpha0": args.pess_alpha0,
+                    "pess_alpha_final": args.pess_alpha_final,
+                    "pess_anneal_steps": args.pess_anneal_steps,
+                    "pess_gamma": args.pess_gamma,
+                    "adv_gate_tau": args.adv_gate_tau,
+                    "adv_gate_k": args.adv_gate_k,
+                    "bonus_eta": args.bonus_eta,
+                    "bonus_center": args.bonus_center,
+                    "bonus_sigma": args.bonus_sigma,
+                    "bonus_type": args.bonus_type,
+                    "adaptive_bonus": args.adaptive_bonus,
+                    "target_return": args.target_return,
+                    "no_pessimism": args.no_pessimism,
+                    "no_bonus": args.no_bonus,
+                    "init_actor": args.init_actor,
+                    "ent_coeff": args.ent_coeff,
+                    "target_kl": args.target_kl,
+                    "vf_clip": args.vf_clip,
+                    "actor_grad_clip": args.actor_grad_clip,
+                    "critic_grad_clip": args.critic_grad_clip,
+                    "support_adaptive_clip": args.support_adaptive_clip,
+                    "kl_bc_coef": args.kl_bc_coef,
+                    "kl_bc_pow": args.kl_bc_pow,
+                    "kl_bc_coef0": args.kl_bc_coef0,
+                    "kl_bc_coef_final": args.kl_bc_coef_final,
+                    "kl_bc_anneal_steps": args.kl_bc_anneal_steps,
+                    "seed": args.seed,
+                },
+            )
+        except Exception as e:
+            print(f"[wandb] init failed, continuing without wandb: {e}")
+            wandb_run = None
 
     env = make_env(args.env_id, seed=args.seed)
     spec = get_space_spec(env)
@@ -258,6 +319,7 @@ def main():
     else:
         obs_p = obs
 
+    bonus = 0.0
     buf = {k: [] for k in ["obs", "act", "rew", "val", "logp", "done", "support", "support_std"]}
     t = 0
     while t < total_steps:
@@ -441,6 +503,25 @@ def main():
             f"alpha {metrics.get('alpha_pess', 0.0):.3f}  w_mean {metrics.get('w_actor_mean', 1.0):.3f}  "
             f"bonus_scale {0.5 * float(np.sqrt(rew_var / max(1.0, rew_cnt - 1.0))):.3f}"
         )
+        if wandb_run:
+            wandb_mod.log(
+                {
+                    "steps": t,
+                    "avg_ep_ret": avg_ret,
+                    "support/mean": sup_mean,
+                    "support/p10": p10,
+                    "support/p90": p90,
+                    "alpha_pess": metrics.get("alpha_pess", 0.0),
+                    "w_actor_mean": metrics.get("w_actor_mean", 0.0),
+                    "v_mse": metrics.get("v_mse", 0.0),
+                    "loss_actor": metrics.get("loss_actor", 0.0),
+                    "bonus_used": bonus,
+                    "rew_std": float(np.sqrt(rew_var / max(1.0, rew_cnt - 1.0))),
+                    "approx_kl": metrics.get("approx_kl", 0.0),
+                    "bc_alpha": metrics.get("bc_alpha", 0.0),
+                },
+                step=t,
+            )
 
         if logger:
             logger.log(
@@ -470,6 +551,8 @@ def main():
     env.close()
     if logger:
         logger.close()
+    if wandb_run:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

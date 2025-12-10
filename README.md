@@ -52,6 +52,7 @@ Quickstart
    - Observation norm (PPO only): `--obs_norm --obs_norm_clip 10.0`
    - BC anchor (stability on continuous control): `--init_actor <bc.pt> --kl_bc_coef 0.5 --kl_bc_pow 1.0` or anneal with `--kl_bc_coef0 0.5 --kl_bc_coef_final 0.1 --kl_bc_anneal_steps 1e5`
    - Logging: `--log_csv logs/run.csv`
+   - Weights & Biases: add `--wandb` (optionally `--wandb_project`, `--wandb_run_name`, `--wandb_group`, `--wandb_tags`, `--wandb_mode online|offline|disabled`)
 
 Example: HalfCheetah-v4 (D4RL medium)
 - Behavior Cloning (GPU):
