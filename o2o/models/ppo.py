@@ -234,22 +234,25 @@ class PPOAgent:
                     ppo_obj = torch.min(ratio * adv_gated, clip_adv)
                     loss_actor = -(ppo_obj).mean()
 
-                    # BC Anchor
+                    # BC Anchor (KL between frozen ref and current policy; fallback to NLL if KL not implemented)
                     if self.kl_bc_coef is not None and self.kl_bc_coef > 0 and self.ref_actor is not None:
                         if self.kl_bc_anneal_steps is not None and self.kl_bc_anneal_steps > 0:
                             frac_bc = max(0.0, 1.0 - (float(current_total_steps) / max(1.0, float(self.kl_bc_anneal_steps))))
                             bc_alpha = self.kl_bc_coef_final + (self.kl_bc_coef0 - self.kl_bc_coef_final) * frac_bc
                         else:
                             bc_alpha = self.kl_bc_coef
-                        
+
                         with torch.no_grad():
                             w_bc = torch.clamp(1.0 - support[mb], 0.0, 1.0)
                             if self.kl_bc_pow is not None and self.kl_bc_pow != 1.0:
                                 w_bc = torch.pow(w_bc, self.kl_bc_pow)
-                        
-                        dist_ref = self.ref_actor(obs[mb])
-                        logp_ref = dist_ref.log_prob(act[mb])
-                        bc_reg = -(w_bc * logp_ref).mean()
+                            dist_ref = self.ref_actor(obs[mb])
+                        try:
+                            kl_div = torch.distributions.kl.kl_divergence(dist_ref, dist)
+                            bc_reg = (w_bc * kl_div).mean()
+                        except Exception:
+                            # Fallback: encourage current policy to place mass on observed actions
+                            bc_reg = -(w_bc * logp).mean()
                         loss_actor = loss_actor + bc_alpha * bc_reg
                         bc_alpha_value = float(bc_alpha)
                     

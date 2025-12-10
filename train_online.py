@@ -59,7 +59,7 @@ def main():
     parser.add_argument("--kl_bc_coef0", type=float, default=0.0)
     parser.add_argument("--kl_bc_coef_final", type=float, default=0.0)
     parser.add_argument("--kl_bc_anneal_steps", type=float, default=0.0)
-    parser.add_argument("--actor_freeze_steps", type=int, default=0, help="Steps to train critic only before actor updates")
+    parser.add_argument("--actor_freeze_steps", type=int, default=2048, help="Steps to train critic only before actor updates")
     # early stopping and logging
     parser.add_argument("--early_stop_avg_return", type=float, default=None)
     parser.add_argument("--early_stop_window", type=int, default=10)
@@ -329,6 +329,9 @@ def main():
                 obs_p = get_obs_p(obs)
 
             if done or truncated:
+                # Prevent value bleed across episodes: treat truncation as terminal for advantages
+                if truncated and len(buf["done"]) > 0:
+                    buf["done"][-1] = 1.0
                 ep_returns.append(ep_ret)
                 obs = env.reset()[0]
                 obs_p = get_obs_p(obs)
