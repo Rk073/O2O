@@ -46,13 +46,45 @@ def main():
     )
     parser.add_argument("--jitter_std", type=float, default=0.1, help="Std for jitter negatives (fraction of action range)")
     parser.add_argument("--calibrate_temperature", action="store_true", help="Calibrate post-hoc temperature on val split")
+    # logging
+    parser.add_argument("--wandb", action="store_true", help="Log training to Weights & Biases")
+    parser.add_argument("--wandb_project", type=str, default="o2o")
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_group", type=str, default=None)
+    parser.add_argument("--wandb_tags", type=str, nargs="*", default=None)
+    parser.add_argument("--wandb_mode", type=str, default=None, choices=["online", "offline", "disabled"])
     args = parser.parse_args()
 
     offline = load_npz_dataset(args.offline_path, args.max_samples)
     env = make_env(args.env_id)
     spec = get_space_spec(env)
 
+    wandb_run = None
+    wandb_mod = None
+    if args.wandb:
+        try:
+            import wandb as _wandb
+
+            wandb_mod = _wandb
+            wandb_run = wandb_mod.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                group=args.wandb_group,
+                tags=args.wandb_tags,
+                mode=args.wandb_mode,
+                config=vars(args),
+            )
+        except Exception as e:
+            print(f"[wandb] init failed, continuing without wandb: {e}")
+            wandb_run = None
+
     device = args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu"
+    def log_cb(metrics: dict, step: int):
+        if wandb_run and wandb_mod:
+            # Drop None values to avoid noisy charts
+            metrics_clean = {k: v for k, v in metrics.items() if v is not None}
+            wandb_mod.log(metrics_clean, step=step)
+
     dsr = train_dsr(
         states=offline["states"],
         actions=offline["actions"],
@@ -78,11 +110,20 @@ def main():
         neg_weights=tuple(args.neg_weights) if args.neg_weights is not None else None,
         jitter_std=args.jitter_std,
         calibrate_temperature=bool(args.calibrate_temperature),
+        log_callback=log_cb if wandb_run else None,
     )
 
     os.makedirs(os.path.dirname(args.dsr_out), exist_ok=True)
     torch.save(dsr.state_dict(), args.dsr_out)
     print(f"Saved DSR to {args.dsr_out}")
+    if wandb_run and wandb_mod:
+        try:
+            art = wandb_mod.Artifact(f"dsr-{args.env_id}".replace("/", "-"), type="model")
+            art.add_file(args.dsr_out)
+            wandb_run.log_artifact(art)
+        except Exception as e:
+            print(f"[wandb] artifact log failed: {e}")
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

@@ -131,6 +131,7 @@ def train_dsr(
     neg_weights: tuple[float, ...] | None = None,
     jitter_std: float = 0.1,
     calibrate_temperature: bool = False,
+    log_callback=None,
 ) -> DSR:
     rng = np.random.default_rng(seed)
     try:
@@ -228,6 +229,7 @@ def train_dsr(
     best_state = None
     best_val = float("inf")
     patience = early_stop_patience
+    last_train_loss = None
     for epoch in range(epochs):
         perm = rng.permutation(len(idx_train))
         for it in range(steps_per_epoch):
@@ -265,6 +267,7 @@ def train_dsr(
             if grad_clip and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
             opt.step()
+            last_train_loss = float(loss.item())
 
             global_it = epoch * steps_per_epoch + it
             if (global_it + 1) % log_every == 0:
@@ -274,6 +277,7 @@ def train_dsr(
                 print(f"[DSR] epoch {epoch} it {it} loss {loss.item():.4f} p_pos {p_pos:.3f} p_neg {p_neg:.3f}")
 
         # validation & early stopping
+        val_l = None
         if idx_val is not None:
             with torch.no_grad():
                 # sample a subset for speed
@@ -303,6 +307,20 @@ def train_dsr(
             if early_stop_patience and patience < 0:
                 print("[DSR] Early stopping due to no val improvement.")
                 break
+
+        if log_callback is not None:
+            try:
+                log_callback(
+                    {
+                        "epoch": int(epoch),
+                        "train_loss": float(last_train_loss) if last_train_loss is not None else None,
+                        "val_loss": float(val_l) if val_l is not None else None,
+                        "best_val": float(best_val) if best_val != float("inf") else None,
+                    },
+                    step=epoch,
+                )
+            except Exception:
+                pass
 
     meta = DSRMetadata(
         state_mean=s_mean,
