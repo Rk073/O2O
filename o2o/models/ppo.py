@@ -248,25 +248,33 @@ class PPOAgent:
                                 w_bc = torch.pow(w_bc, self.kl_bc_pow)
                             dist_ref = self.ref_actor(obs[mb])
                         
+                        # PROFESSOR ARIADNE'S COMPULSORY FIX
+                        # We must access the underlying Normal distributions (base_dist)
+                        # to calculate KL Divergence for Tanh-squashed policies.
+                        
                         try:
                             if hasattr(dist, "base_dist") and hasattr(dist_ref, "base_dist"):
-                                # KL on the Gaussian (ignoring Tanh) for continuous control
+                                # Continuous Control: KL( Gaussian_Ref || Gaussian_Curr )
+                                # This is mathematically stable and correctly anchors the policy.
                                 kl_div = torch.distributions.kl.kl_divergence(dist_ref.base_dist, dist.base_dist)
                             else:
-                                # Discrete actions
+                                # Discrete Control
                                 kl_div = torch.distributions.kl.kl_divergence(dist_ref, dist)
                             
                             bc_reg = (w_bc * kl_div).mean()
-                        except Exception:
-                            # Monte Carlo KL: E_ref[log p_ref - log p_curr]
+                            
+                        except Exception as e:
+                            # Fallback: Monte Carlo Approximation (The only valid alternative)
+                            # Sample from Reference, evaluate on Current
                             with torch.no_grad():
                                 x_sample = dist_ref.sample()
                                 logp_ref = dist_ref.log_prob(x_sample)
-                            logp_curr = dist.log_prob(x_sample)
-                            bc_reg = (w_bc * (logp_ref - logp_curr)).mean()
                             
+                            logp_curr = dist.log_prob(x_sample)
+                            # KL approx = E[ log P_ref - log P_curr ]
+                            bc_reg = (w_bc * (logp_ref - logp_curr)).mean()
+
                         loss_actor = loss_actor + bc_alpha * bc_reg
-                        bc_alpha_value = float(bc_alpha)
                     # ----------------------------------------------------------
                     
                     ent = dist.entropy().mean()
