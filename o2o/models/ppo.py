@@ -234,7 +234,7 @@ class PPOAgent:
                     ppo_obj = torch.min(ratio * adv_gated, clip_adv)
                     loss_actor = -(ppo_obj).mean()
 
-                    # BC Anchor (KL between frozen ref and current policy)
+                    # --- BC Anchor (Correct handling for Tanh distributions) ---
                     if self.kl_bc_coef is not None and self.kl_bc_coef > 0 and self.ref_actor is not None:
                         if self.kl_bc_anneal_steps is not None and self.kl_bc_anneal_steps > 0:
                             frac_bc = max(0.0, 1.0 - (float(current_total_steps) / max(1.0, float(self.kl_bc_anneal_steps))))
@@ -247,24 +247,27 @@ class PPOAgent:
                             if self.kl_bc_pow is not None and self.kl_bc_pow != 1.0:
                                 w_bc = torch.pow(w_bc, self.kl_bc_pow)
                             dist_ref = self.ref_actor(obs[mb])
+                        
                         try:
                             if hasattr(dist, "base_dist") and hasattr(dist_ref, "base_dist"):
-                                # Continuous control: KL on pre-tanh Gaussians
+                                # KL on the Gaussian (ignoring Tanh) for continuous control
                                 kl_div = torch.distributions.kl.kl_divergence(dist_ref.base_dist, dist.base_dist)
                             else:
-                                # Discrete: direct KL
+                                # Discrete actions
                                 kl_div = torch.distributions.kl.kl_divergence(dist_ref, dist)
+                            
                             bc_reg = (w_bc * kl_div).mean()
-                        except NotImplementedError:
-                            # Monte Carlo KL approximation: E_ref[log p_ref - log p_curr]
+                        except Exception:
+                            # Monte Carlo KL: E_ref[log p_ref - log p_curr]
                             with torch.no_grad():
-                                x_ref = dist_ref.sample()
-                                logp_ref = dist_ref.log_prob(x_ref)
-                            logp_curr = dist.log_prob(x_ref)
-                            kl_approx = logp_ref - logp_curr
-                            bc_reg = (w_bc * kl_approx).mean()
+                                x_sample = dist_ref.sample()
+                                logp_ref = dist_ref.log_prob(x_sample)
+                            logp_curr = dist.log_prob(x_sample)
+                            bc_reg = (w_bc * (logp_ref - logp_curr)).mean()
+                            
                         loss_actor = loss_actor + bc_alpha * bc_reg
                         bc_alpha_value = float(bc_alpha)
+                    # ----------------------------------------------------------
                     
                     ent = dist.entropy().mean()
                     
