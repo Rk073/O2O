@@ -56,6 +56,8 @@ class DSR:
     def support(self, states: np.ndarray | torch.Tensor, actions: np.ndarray | torch.Tensor) -> torch.Tensor:
         s = torch.as_tensor(states, dtype=torch.float32, device=self.device)
         a = torch.as_tensor(actions, dtype=torch.float32, device=self.device)
+        
+        # Normalize inputs using offline statistics
         s = (s - torch.as_tensor(self.meta.state_mean, device=self.device)) / (
             torch.as_tensor(self.meta.state_std, device=self.device) + 1e-6
         )
@@ -63,6 +65,7 @@ class DSR:
             a = (a - torch.as_tensor(self.meta.action_mean, device=self.device)) / (
                 torch.as_tensor(self.meta.action_std, device=self.device) + 1e-6
             )
+            
         temp = float(self.meta.temperature) if self.meta.temperature is not None else 1.0
         ctemp = float(self.meta.calib_temperature) if hasattr(self.meta, 'calib_temperature') and self.meta.calib_temperature is not None else 1.0
         logits = self.net(s, self._one_hot_if_needed(a)) / max(temp * ctemp, 1e-6)
@@ -81,21 +84,18 @@ class DSR:
 
     @staticmethod
     def load(path: str, device: str = "cpu") -> "DSR":
-        # weights_only=False to allow loading metadata dict with numpy arrays (trusted local file)
         chk = torch.load(path, map_location=device, weights_only=False)
         meta = DSRMetadata(**chk["meta"])
-        # Infer hidden sizes from checkpoint if possible (for compatibility with varied configs)
         hidden = None
         try:
             w_keys = [(k, v) for k, v in chk["model"].items() if k.startswith("net.") and k.endswith(".weight")]
-            # sort by layer index (net.0, net.2, ...)
             def layer_idx(k):
                 parts = k.split(".")
                 return int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
             w_keys.sort(key=lambda kv: layer_idx(kv[0]))
             outs = [int(w.shape[0]) for _, w in w_keys]
             if len(outs) >= 2:
-                hidden = tuple(outs[:-1])  # exclude final output layer
+                hidden = tuple(outs[:-1])
         except Exception:
             hidden = None
         if hidden is None or len(hidden) == 0:
@@ -127,7 +127,7 @@ def train_dsr(
     seed: int | None = None,
     val_split: float = 0.0,
     early_stop_patience: int = 0,
-    neg_modes: tuple[str, ...] = ("uniform", "hard"), # Added 'hard' default
+    neg_modes: tuple[str, ...] = ("hard", "jitter"),
     neg_weights: tuple[float, ...] | None = None,
     jitter_std: float = 0.1,
     calibrate_temperature: bool = False,
@@ -143,7 +143,7 @@ def train_dsr(
     n = states.shape[0]
     state_dim = states.shape[1]
     
-    # normalization
+    # Normalization (Train internal DSR on normalized data)
     s_mean = states.mean(axis=0)
     s_std = states.std(axis=0) + 1e-6
     states_n = (states - s_mean) / s_std
@@ -151,7 +151,6 @@ def train_dsr(
     if discrete:
         a_mean = None
         a_std = None
-        # Convert actions to one-hot for training consistency
         a_train = one_hot(actions.astype(np.int64), action_dim)
     else:
         a_mean = actions.mean(axis=0)
@@ -175,81 +174,19 @@ def train_dsr(
         idx_train = idx_all
         idx_val = None
 
-    # helper: negative sampler
-    def gen_negatives(s_pos_np: np.ndarray, k: int) -> np.ndarray:
-        mlist = list(neg_modes) if neg_modes else ["uniform", "hard"]
-        w = np.array(neg_weights if neg_weights is not None else [1.0] * len(mlist), dtype=np.float32)
+    # REVISED Negative Sampler: Prioritizes Hard/Jitter over Uniform
+    def gen_negatives(s_pos_np: np.ndarray, a_pos_np: np.ndarray, k: int) -> np.ndarray:
+        mlist = list(neg_modes) if neg_modes else ["hard", "jitter"]
+        default_w = [1.0] * len(mlist)
+        w = np.array(neg_weights if neg_weights is not None else default_w, dtype=np.float32)
         w = w / (w.sum() + 1e-8)
         counts = np.maximum(1, np.round(w * k).astype(int))
+        
         # adjust to sum exactly k
         diff = k - counts.sum()
         if diff != 0:
-            counts[0] += diff
-        outs = []
-        B = s_pos_np.shape[0]
-        
-        # Pre-select random indices from dataset for 'hard' negatives
-        # We sample from the entire training set actions
-        
-        for mode, c in zip(mlist, counts):
-            if c <= 0:
-                continue
+            counts[np.argmax(counts)] += diff
             
-            if mode == "hard":
-                # Sample random real actions from the dataset
-                rand_idxs = rng.integers(0, len(a_train), size=(B, c))
-                a_hard = a_train[rand_idxs] # (B, c, action_dim)
-                outs.append(a_hard)
-                continue
-
-            if discrete:
-                if mode == "uniform" or mode == "jitter" or mode == "shuffle":
-                    neg_idx = np.random.randint(0, action_dim, size=(B, c))
-                    a_neg = np.eye(action_dim, dtype=np.float32)[neg_idx]
-                    outs.append(a_neg)
-            else:
-                low = action_low if action_low is not None else -1.0
-                high = action_high if action_high is not None else 1.0
-                
-                if mode == "uniform":
-                    a_u = np.random.rand(B, c, a_train.shape[1]).astype(np.float32)
-                    a_u = a_u * (high - low) + low
-                    # Normalize to match a_train distribution space
-                    a_u = (a_u - a_mean) / a_std
-                    outs.append(a_u)
-                elif mode == "shuffle":
-                    # in-batch shuffled actions (permutation)
-                    # We grab a batch of random actions from the current batch if possible, or random from train
-                    # Here we just use random permutation of current batch repeats
-                    # Actually, let's just pick random actions from a_train to be safe/simple like 'hard' 
-                    # but 'shuffle' usually implies local batch shuffling. 
-                    # Let's stick to 'hard' covering the "sample from dataset" case.
-                    # Implementing standard batch shuffle:
-                    perm = rng.permutation(B)
-                    # This repeats the shuffled action c times
-                    a_s = np.repeat(a_pos_np[perm][:, None, :], c, axis=1) # Note: a_pos_np needed in scope
-                    # Wait, gen_negatives arguments changed? I need to pass a_pos_np if I want shuffle.
-                    # But 'hard' is better. Let's just implement uniform/jitter/hard.
-                    outs.append(a_s)
-                elif mode == "jitter":
-                    # Jitter requires the current positive action
-                    # I'll modify the function signature to accept it implicitly or explicitly.
-                    # Current signature is gen_negatives(s_pos, k). 
-                    # I need to change how it's called to pass a_pos if I want jitter/shuffle.
-                    pass 
-
-        a_neg_all = np.concatenate(outs, axis=1) if outs else np.zeros((B, k, a_train.shape[1] if not discrete else action_dim), dtype=np.float32)
-        return a_neg_all
-
-    # Redefine to accept a_pos for shuffle/jitter support
-    def gen_negatives_v2(s_pos_np: np.ndarray, a_pos_np: np.ndarray, k: int) -> np.ndarray:
-        mlist = list(neg_modes) if neg_modes else ["uniform"]
-        w = np.array(neg_weights if neg_weights is not None else [1.0] * len(mlist), dtype=np.float32)
-        w = w / (w.sum() + 1e-8)
-        counts = np.maximum(1, np.round(w * k).astype(int))
-        diff = k - counts.sum()
-        if diff != 0: counts[0] += diff
-        
         outs = []
         B = s_pos_np.shape[0]
         
@@ -257,47 +194,34 @@ def train_dsr(
             if c <= 0: continue
             
             if mode == "hard":
-                # Sample random REAL actions from the dataset
-                # This makes the DSR learn the manifold of "feasible" actions
+                # Hard Negatives: Sample real actions from other parts of the dataset
                 rand_idxs = rng.integers(0, len(a_train), size=(B, c))
                 a_hard = a_train[rand_idxs]
                 outs.append(a_hard)
-                continue
-
-            if discrete:
-                if mode in ["uniform", "jitter", "shuffle"]:
-                    neg_idx = np.random.randint(0, action_dim, size=(B, c))
-                    a_neg = np.eye(action_dim, dtype=np.float32)[neg_idx]
-                    outs.append(a_neg)
-            else:
-                # For continuous, bounds check
-                # Note: a_train is normalized. We generate in raw space then normalize.
-                low_n = -float("inf") # limits for normalized space not known, generate raw then normalize
-                low_raw = action_low if action_low is not None else -1.0
-                high_raw = action_high if action_high is not None else 1.0
                 
-                if mode == "uniform":
-                    a_u = np.random.rand(B, c, a_train.shape[1]).astype(np.float32)
-                    a_u = a_u * (high_raw - low_raw) + low_raw
-                    # Normalize
-                    a_u = (a_u - a_mean) / a_std
-                    outs.append(a_u)
-                elif mode == "shuffle":
-                    perm = rng.permutation(B)
-                    a_s = np.repeat(a_pos_np[perm][:, None, :], c, axis=1)
-                    outs.append(a_s)
-                elif mode == "jitter":
-                    # Jitter in normalized space is easier? Or raw?
-                    # Let's jitter in raw space to respect action magnitude physics
-                    a_pos_raw = a_pos_np * a_std + a_mean
-                    noise = jitter_std * (high_raw - low_raw) * rng.standard_normal(size=(B, c, a_train.shape[1])).astype(np.float32)
-                    a_j = a_pos_raw[:, None, :] + noise
-                    a_j = np.clip(a_j, low_raw, high_raw)
-                    a_j = (a_j - a_mean) / a_std
-                    outs.append(a_j)
+            elif not discrete and mode == "jitter":
+                # Jitter Negatives: Local perturbation of the positive action
+                # a_pos_np is normalized, so we jitter in normalized space
+                noise = rng.standard_normal(size=(B, c, a_train.shape[1])).astype(np.float32) * jitter_std
+                a_j = a_pos_np[:, None, :] + noise
+                # Clip to reasonable normalized bounds (approx 4 std devs)
+                a_j = np.clip(a_j, -4.0, 4.0)
+                outs.append(a_j)
+                
+            elif not discrete and mode == "uniform":
+                # Uniform Negatives: Global coverage
+                low_n = -3.0 # Approx 3 std devs
+                high_n = 3.0
+                a_u = rng.uniform(low_n, high_n, size=(B, c, a_train.shape[1])).astype(np.float32)
+                outs.append(a_u)
+                
+            elif discrete:
+                # Discrete fallbacks
+                neg_idx = np.random.randint(0, action_dim, size=(B, c))
+                a_neg = np.eye(action_dim, dtype=np.float32)[neg_idx]
+                outs.append(a_neg)
 
-        if not outs:
-            # Fallback
+        if not outs: 
             return np.zeros((B, k, a_train.shape[1] if not discrete else action_dim), dtype=np.float32)
             
         return np.concatenate(outs, axis=1)
@@ -313,11 +237,9 @@ def train_dsr(
         perm = rng.permutation(len(idx_train))
         for it in range(steps_per_epoch):
             idx_loc = perm[it * batch_size : (it + 1) * batch_size]
-            if idx_loc.size == 0:
-                continue
+            if idx_loc.size == 0: continue
             idx = idx_train[idx_loc]
-            if len(idx) == 0:
-                continue
+            if len(idx) == 0: continue
             
             s_pos_np = states_n[idx]
             a_pos_np = a_train[idx]
@@ -325,17 +247,16 @@ def train_dsr(
             s_pos = torch.as_tensor(s_pos_np, dtype=torch.float32, device=device)
             a_pos = torch.as_tensor(a_pos_np, dtype=torch.float32, device=device)
 
-            # Generate negatives using v2 with hard negatives support
-            a_neg_np = gen_negatives_v2(s_pos_np, a_pos_np, num_negatives)
-
+            # Generate Negatives
+            a_neg_np = gen_negatives(s_pos_np, a_pos_np, num_negatives)
             s_neg = s_pos.repeat_interleave(num_negatives, dim=0)
             a_neg = torch.as_tensor(a_neg_np.reshape(len(idx) * num_negatives, -1), dtype=torch.float32, device=device)
 
-            # logits
+            # Logits
             logits_pos = net(s_pos, a_pos) / max(temperature, 1e-6)
             logits_neg = net(s_neg, a_neg) / max(temperature, 1e-6)
 
-            # BCE with logits: positives->1, negatives->0
+            # Loss (Positives -> 1, Negatives -> 0)
             loss_pos = F.binary_cross_entropy_with_logits(logits_pos, torch.ones_like(logits_pos))
             loss_neg = F.binary_cross_entropy_with_logits(logits_neg, torch.zeros_like(logits_neg))
             loss = loss_pos + loss_neg
@@ -354,7 +275,7 @@ def train_dsr(
                     p_neg = torch.sigmoid(logits_neg).mean().item()
                 print(f"[DSR] epoch {epoch} it {it} loss {loss.item():.4f} p_pos {p_pos:.3f} p_neg {p_neg:.3f}")
 
-        # validation & early stopping
+        # Validation
         val_l = None
         if idx_val is not None:
             with torch.no_grad():
@@ -364,7 +285,7 @@ def train_dsr(
                 a_val_np = a_train[sel]
                 a_val = torch.as_tensor(a_val_np, dtype=torch.float32, device=device)
                 
-                a_val_neg_np = gen_negatives_v2(states_n[sel], a_val_np, num_negatives)
+                a_val_neg_np = gen_negatives(states_n[sel], a_val_np, num_negatives)
                 s_val_neg = s_val.repeat_interleave(num_negatives, dim=0)
                 a_val_neg = torch.as_tensor(a_val_neg_np.reshape(val_bs * num_negatives, -1), dtype=torch.float32, device=device)
                 
@@ -372,12 +293,14 @@ def train_dsr(
                 ln = net(s_val_neg, a_val_neg) / max(temperature, 1e-6)
                 val_loss = F.binary_cross_entropy_with_logits(lp, torch.ones_like(lp)) + F.binary_cross_entropy_with_logits(ln, torch.zeros_like(ln))
                 val_l = float(val_loss.item())
+                
             if val_l < best_val - 1e-6:
                 best_val = val_l
                 best_state = {k: v.cpu().clone() for k, v in net.state_dict().items()}
                 patience = early_stop_patience
             else:
                 patience -= 1
+                
             print(f"[DSR] epoch {epoch} val_loss {val_l:.4f} best {best_val:.4f} patience {patience}")
             if early_stop_patience and patience < 0:
                 print("[DSR] Early stopping due to no val improvement.")
@@ -385,34 +308,44 @@ def train_dsr(
 
         if log_callback is not None:
             try:
-                log_callback(
-                    {
-                        "epoch": int(epoch),
-                        "train_loss": float(last_train_loss) if last_train_loss is not None else None,
-                        "val_loss": float(val_l) if val_l is not None else None,
-                        "best_val": float(best_val) if best_val != float("inf") else None,
-                    },
-                    step=epoch,
-                )
-            except Exception:
-                pass
+                log_callback({"epoch": int(epoch), "train_loss": float(last_train_loss), "val_loss": float(val_l)}, step=epoch)
+            except Exception: pass
 
     meta = DSRMetadata(
-        state_mean=s_mean,
-        state_std=s_std,
-        action_mean=a_mean,
-        action_std=a_std,
-        state_dim=state_dim,
-        action_dim=action_dim,
-        discrete=bool(discrete),
-        action_low=action_low,
-        action_high=action_high,
-        temperature=temperature,
-        calib_temperature=1.0,
+        state_mean=s_mean, state_std=s_std, action_mean=a_mean, action_std=a_std,
+        state_dim=state_dim, action_dim=action_dim, discrete=bool(discrete),
+        action_low=action_low, action_high=action_high, temperature=temperature, calib_temperature=1.0,
     )
     dsr = DSR(net, meta, device=device)
     if best_state is not None:
         dsr.net.load_state_dict(best_state)
+
+    # Post-hoc calibration
+    if calibrate_temperature and idx_val is not None and len(idx_val) > 0:
+        with torch.no_grad():
+            val_bs = min(10000, len(idx_val))
+            sel = rng.choice(idx_val, size=val_bs, replace=False)
+            s_val = torch.as_tensor(states_n[sel], dtype=torch.float32, device=device)
+            a_val_np = a_train[sel]
+            a_val = torch.as_tensor(a_val_np, dtype=torch.float32, device=device)
+            a_val_neg_np = gen_negatives(states_n[sel], a_val_np, num_negatives)
+            s_val_neg = s_val.repeat_interleave(num_negatives, dim=0)
+            a_val_neg = torch.as_tensor(a_val_neg_np.reshape(val_bs * num_negatives, -1), dtype=torch.float32, device=device)
+            
+            lp = dsr.net(s_val, a_val)
+            ln = dsr.net(s_val_neg, a_val_neg)
+            y = torch.cat([torch.ones_like(lp), torch.zeros_like(ln)], dim=0)
+            logits = torch.cat([lp, ln], dim=0)
+            
+            cands = torch.logspace(np.log10(0.5), np.log10(3.0), steps=21, device=device)
+            best_c, best_bce = 1.0, float("inf")
+            for c in cands:
+                bce = F.binary_cross_entropy_with_logits(logits / (temperature * c), y).item()
+                if bce < best_bce:
+                    best_bce = bce
+                    best_c = float(c.item())
+            dsr.meta.calib_temperature = best_c
+            print(f"[DSR] Calibrated temperature factor: {best_c:.3f} (val BCE {best_bce:.4f})")
 
     return dsr
 

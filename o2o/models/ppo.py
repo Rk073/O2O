@@ -166,7 +166,7 @@ class PPOAgent:
         return adv, ret
 
     def get_pessimism_alpha(self, current_total_steps: int) -> float:
-        """Calculate current pessimism coefficient based on anneal schedule."""
+        """Calculate current pessimism coefficient."""
         frac = max(0.0, 1.0 - (float(current_total_steps) / max(1.0, float(self.pess_anneal_steps))))
         alpha = self.pess_alpha_final + (self.pess_alpha0 - self.pess_alpha_final) * frac
         return alpha
@@ -181,7 +181,7 @@ class PPOAgent:
 
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        # Gate weights
+        # Gate weights calculation
         with torch.no_grad():
             tau = self.adv_gate_tau
             if self.adv_gate_tau0 is not None and self.adv_gate_tau_final is not None and self.adv_gate_tau_anneal_steps is not None and self.adv_gate_tau_anneal_steps > 0:
@@ -212,8 +212,15 @@ class PPOAgent:
                 logp = dist.log_prob(act[mb])
                 ratio = torch.exp(logp - logp_old[mb])
                 
-                adv_gated = adv[mb] * w[mb]
-                adv_gated = (adv_gated - adv_gated.mean()) / (adv_gated.std() + 1e-8)
+                # Asymmetric Advantage Gating:
+                # Gate positive advantages (don't overfit to OOD luck)
+                # Pass negative advantages fully (learn from OOD mistakes)
+                adv_mb = adv[mb]
+                adv_gated = torch.where(adv_mb > 0, adv_mb * w[mb], adv_mb)
+                
+                # Normalize after gating for stability
+                if adv_gated.std() > 1e-8:
+                    adv_gated = (adv_gated - adv_gated.mean()) / (adv_gated.std() + 1e-8)
                 
                 if self.support_adaptive_clip:
                     coef = 0.5 + 0.5 * w[mb]
@@ -253,10 +260,9 @@ class PPOAgent:
                     torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.actor_grad_clip)
                 self.opt_actor.step()
 
-                # Critic Update (Pessimism applied to rewards via 'ret', not value target shaping)
+                # Critic Update
                 v = self.critic(obs[mb])
-                # Target is just return (which now includes pessimism penalty)
-                value_target = ret[mb]
+                value_target = ret[mb] # Rewards already shaped in buffer
                 
                 v_old_mb = None
                 if 'v_old' in buf:
@@ -301,7 +307,7 @@ class PPOAgent:
         return {
             "v_mse": avg_v_mse,
             "loss_actor": avg_loss_actor,
-            "alpha_pess": self.get_pessimism_alpha(current_total_steps), # just for logging
+            "alpha_pess": self.get_pessimism_alpha(current_total_steps),
             "w_actor_mean": float(w.mean().item()),
             "approx_kl": float(approx_kl_mean),
             "early_stop": bool(early_stop),
@@ -315,6 +321,8 @@ class PPOAgent:
         return v
 
     def compute_support(self, obs: np.ndarray, act: np.ndarray) -> float:
+        # DSR expects raw or offline-normalized inputs (handled internally in DSR.support)
+        # obs should be RAW observations here
         with torch.no_grad():
             sup = self.dsr.support(
                 torch.as_tensor(obs[None, ...], dtype=torch.float32, device=self.device),

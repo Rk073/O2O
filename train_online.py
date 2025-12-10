@@ -153,36 +153,7 @@ def main():
         sd = torch.load(args.init_actor, map_location=device)
         agent.actor.load_state_dict(sd)
 
-    obs = env.reset(seed=args.seed)[0]
-    ep_ret, ep_len = 0.0, 0
-    ep_returns = deque(maxlen=10)
-    rew_mean, rew_var, rew_cnt = 0.0, 1.0, 1e-6
-
-    def update_running_stats(x: float):
-        nonlocal rew_mean, rew_var, rew_cnt
-        rew_cnt += 1.0
-        delta = x - rew_mean
-        rew_mean += delta / rew_cnt
-        rew_var += delta * (x - rew_mean)
-
-    logger = None
-    if args.log_csv:
-        from o2o.utils.logger import CSVLogger
-        import time, os
-        log_path = args.log_csv
-        if os.path.isdir(log_path) or log_path.endswith(os.sep):
-            ts = int(time.time())
-            os.makedirs(log_path, exist_ok=True)
-            log_path = os.path.join(log_path, f"run_{ts}.csv")
-        logger = CSVLogger(log_path, ["steps", "avg_ep_ret", "support_mean", "support_p10", "support_p90", "alpha_pess", "w_actor_mean", "v_mse", "loss_actor", "bonus_used", "rew_std", "pess_penalty"])
-
-    # Observation Normalization for PPO
-    # NOTE: DSR and RefActor (BC) assume RAW or OFFLINE-stat normalized observations.
-    # PPO assumes ONLINE normalized observations.
-    # We maintain obs_p (processed) for PPO, and obs (raw) for DSR/Metrics.
-    # Warning: RefActor likely expects RAW inputs (if trained on raw offline data) or needs its own normalization.
-    # Here we assume RefActor is robust or trained on similar range, or that obs_rn is disabled if BC is critical.
-    
+    # Observation Normalization for PPO only
     class RunningNorm:
         def __init__(self, shape: int, clip: float = 10.0):
             self.mean = np.zeros((shape,), dtype=np.float32)
@@ -206,16 +177,57 @@ def main():
 
     obs_rn = RunningNorm(spec.state_dim, clip=args.obs_norm_clip) if args.obs_norm else None
     
-    # helper for obs norm
     def get_obs_p(raw_obs):
         if obs_rn is not None:
             obs_rn.update(raw_obs)
             return obs_rn.normalize(raw_obs)
         return raw_obs
 
+    # Auto-Calibration of Bonus Center (heuristic)
+    if args.bonus_center < 0:
+        print("[train_online] Auto-tuning bonus center...")
+        obs_cal = env.reset(seed=args.seed)[0]
+        obs_cal_batch = []
+        act_cal_batch = []
+        for _ in range(256):
+            obs_p_cal = get_obs_p(obs_cal)
+            a_cal, _, _ = agent.select_action(obs_p_cal)
+            obs_cal_batch.append(obs_cal)
+            act_cal_batch.append(a_cal)
+            step_res = env.step(a_cal)
+            if len(step_res) == 5: obs_cal, _, d, t, _ = step_res
+            else: obs_cal, _, d, _ = step_res
+            if d or t: obs_cal = env.reset()[0]
+            
+        sup_cal_mean = agent.compute_support(np.stack(obs_cal_batch), np.stack(act_cal_batch))
+        agent.bonus_center = float(sup_cal_mean * 0.9)
+        print(f"[train_online] Bonus center set to {agent.bonus_center:.3f} (based on init policy support {sup_cal_mean:.3f})")
+
+    obs = env.reset(seed=args.seed)[0]
     obs_p = get_obs_p(obs)
+    ep_ret, ep_len = 0.0, 0
+    ep_returns = deque(maxlen=10)
+    rew_mean, rew_var, rew_cnt = 0.0, 1.0, 1e-6
+
+    def update_running_stats(x: float):
+        nonlocal rew_mean, rew_var, rew_cnt
+        rew_cnt += 1.0
+        delta = x - rew_mean
+        rew_mean += delta / rew_cnt
+        rew_var += delta * (x - rew_mean)
+
+    logger = None
+    if args.log_csv:
+        from o2o.utils.logger import CSVLogger
+        import time, os
+        log_path = args.log_csv
+        if os.path.isdir(log_path) or log_path.endswith(os.sep):
+            ts = int(time.time())
+            os.makedirs(log_path, exist_ok=True)
+            log_path = os.path.join(log_path, f"run_{ts}.csv")
+        logger = CSVLogger(log_path, ["steps", "avg_ep_ret", "support_mean", "support_p10", "support_p90", "alpha_pess", "w_actor_mean", "v_mse", "loss_actor", "bonus_used", "rew_std", "pess_penalty"])
+
     t = 0
-    
     buf = {k: [] for k in ["obs", "act", "rew", "val", "logp", "done", "support", "support_std"]}
     
     while t < args.total_steps:
@@ -226,10 +238,8 @@ def main():
                 ep_ret, ep_len = 0.0, 0
                 continue
 
-            # Select Action using PPO normalized obs
             a, logp, ent = agent.select_action(obs_p)
             
-            # Clip continuous actions
             if not spec.discrete:
                 low = np.array(spec.action_low_vec, dtype=np.float32)
                 high = np.array(spec.action_high_vec, dtype=np.float32)
@@ -251,7 +261,6 @@ def main():
 
             # DSR Support Calculation (Use RAW obs)
             if not spec.discrete:
-                # Jitter for continuous support estimation
                 a_vec = np.array(a, dtype=np.float32)
                 low, high = np.array(spec.action_low_vec, dtype=np.float32), np.array(spec.action_high_vec, dtype=np.float32)
                 eps = 0.05 * (high - low)
@@ -269,7 +278,6 @@ def main():
             bonus_arr = agent.compute_bonus(np.array([sup_mean], dtype=np.float32), np.array([sup_std], dtype=np.float32))
             bonus = float(max(0.0, float(bonus_arr[0])))
             
-            # Scale bonus
             rew_std_val = float(np.sqrt(rew_var / max(1.0, rew_cnt - 1.0)))
             if args.adaptive_bonus and len(ep_returns) > 0:
                 avg_return = float(np.mean(ep_returns))
@@ -277,20 +285,20 @@ def main():
                 bonus *= (args.bonus_alpha * perf_scale)
             bonus = float(np.clip(bonus, 0.0, 0.5 * max(1e-6, rew_std_val)))
 
-            # Pessimism Penalty (Reward Shaping) - The Fix for Value Target issue
+            # Pessimism Penalty (Reward Shaping)
             pess_alpha = agent.get_pessimism_alpha(t)
             inv_sup = max(0.0, 1.0 - sup_mean)
             if agent.pess_gamma != 1.0:
                 inv_sup = inv_sup ** agent.pess_gamma
             pess_penalty = pess_alpha * inv_sup
             
+            # PROFESSOR FIX: Modify return directly, do not hack value target
             r_total = float(r + bonus - pess_penalty)
 
-            # Store in buffer
             v = agent.evaluate_value(obs_p)
             buf["obs"].append(obs_p)
             buf["act"].append(a)
-            buf["rew"].append(r_total) # GAE will use this shaped reward
+            buf["rew"].append(r_total)
             buf["val"].append(v)
             buf["logp"].append(logp)
             buf["done"].append(float(done or truncated))
@@ -320,7 +328,6 @@ def main():
             if t >= args.total_steps:
                 break
 
-        # GAE Calculation
         last_val = agent.evaluate_value(obs_p)
         rewards = np.array(buf["rew"], dtype=np.float32)
         values = np.array(buf["val"], dtype=np.float32)
@@ -339,7 +346,6 @@ def main():
             "v_old": np.array(buf["val"], dtype=np.float32),
         }
         
-        # Filter invalid
         mask = np.isfinite(batch["obs"]).all(axis=1) & np.isfinite(batch["ret"]) & np.isfinite(batch["adv"])
         if not spec.discrete: mask &= np.isfinite(batch["act"]).all(axis=-1)
         else: mask &= np.isfinite(batch["act"])
@@ -354,7 +360,6 @@ def main():
         metrics = agent.update(batch, minibatch_size=args.minibatch_size, train_iters=args.train_iters, current_total_steps=t)
         buf = {k: [] for k in buf}
 
-        # Logging
         avg_ret = np.mean(ep_returns) if len(ep_returns) else 0.0
         sup = batch["support"]
         sup_mean = float(np.mean(sup)) if sup.size else 0.0

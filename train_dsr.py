@@ -34,14 +34,14 @@ def main():
         "--neg_modes",
         type=str,
         nargs="*",
-        default=["uniform"],
-        help="Negative sampling modes: uniform shuffle jitter",
+        default=["hard", "jitter"], # PROFESSOR FIX
+        help="Negative sampling modes: uniform shuffle jitter hard",
     )
     parser.add_argument(
         "--neg_weights",
         type=float,
         nargs="*",
-        default=None,
+        default=[0.5, 0.5], # PROFESSOR FIX
         help="Weights for negative modes (same length as neg_modes)",
     )
     parser.add_argument("--jitter_std", type=float, default=0.1, help="Std for jitter negatives (fraction of action range)")
