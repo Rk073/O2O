@@ -321,18 +321,20 @@ class PPOAgent:
         return v
 
     def compute_support(self, obs: np.ndarray, act: np.ndarray) -> float:
-        # DSR expects raw or offline-normalized inputs (handled internally in DSR.support)
-        # obs should be RAW observations here
+        # Accept single or batched obs/actions; returns mean support for consistency
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        act_t = torch.as_tensor(
+            act,
+            dtype=torch.float32 if not self.discrete else torch.long,
+            device=self.device,
+        )
+        if obs_t.dim() == 1:
+            obs_t = obs_t.unsqueeze(0)
+        if act_t.dim() == 1:
+            act_t = act_t.unsqueeze(0)
         with torch.no_grad():
-            sup = self.dsr.support(
-                torch.as_tensor(obs[None, ...], dtype=torch.float32, device=self.device),
-                torch.as_tensor(
-                    act[None, ...],
-                    dtype=torch.float32 if not self.discrete else torch.long,
-                    device=self.device,
-                ),
-            ).item()
-        return sup
+            sup = self.dsr.support(obs_t, act_t)
+        return float(sup.mean().item())
 
     def compute_entropy_bonus(self, support: np.ndarray) -> np.ndarray:
         sup_t = torch.as_tensor(support, dtype=torch.float32, device=self.device)
