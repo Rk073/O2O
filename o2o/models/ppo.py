@@ -171,7 +171,7 @@ class PPOAgent:
         alpha = self.pess_alpha_final + (self.pess_alpha0 - self.pess_alpha_final) * frac
         return alpha
 
-    def update(self, buf: dict, minibatch_size: int, train_iters: int, current_total_steps: int):
+    def update(self, buf: dict, minibatch_size: int, train_iters: int, current_total_steps: int, train_actor: bool = True):
         obs = torch.as_tensor(buf["obs"], dtype=torch.float32, device=self.device)
         act = torch.as_tensor(buf["act"], dtype=torch.float32 if not self.discrete else torch.long, device=self.device)
         adv = torch.as_tensor(buf["adv"], dtype=torch.float32, device=self.device)
@@ -207,58 +207,59 @@ class PPOAgent:
             for start in range(0, n, minibatch_size):
                 mb = idxs[start : start + minibatch_size]
                 
-                # Actor Update
-                dist = self.actor(obs[mb])
-                logp = dist.log_prob(act[mb])
-                ratio = torch.exp(logp - logp_old[mb])
-                
-                # Asymmetric Advantage Gating:
-                # Gate positive advantages (don't overfit to OOD luck)
-                # Pass negative advantages fully (learn from OOD mistakes)
-                w = torch.sigmoid(self.adv_gate_k * (support - tau))
-                adv_gated = torch.where(adv[mb] > 0, adv[mb] * w[mb], adv[mb])
-                
-                # Normalize after gating for stability
-                if adv_gated.std() > 1e-8:
-                    adv_gated = (adv_gated - adv_gated.mean()) / (adv_gated.std() + 1e-8)
-                
-                if self.support_adaptive_clip:
-                    coef = 0.5 + 0.5 * w[mb]
-                    clip_low = 1 - self.clip_ratio * coef
-                    clip_high = 1 + self.clip_ratio * coef
-                    clip_adv = torch.clamp(ratio, clip_low, clip_high) * adv_gated
-                else:
-                    clip_adv = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * adv_gated
-                
-                ppo_obj = torch.min(ratio * adv_gated, clip_adv)
-                loss_actor = -(ppo_obj).mean()
-
-                # BC Anchor
-                if self.kl_bc_coef is not None and self.kl_bc_coef > 0 and self.ref_actor is not None:
-                    if self.kl_bc_anneal_steps is not None and self.kl_bc_anneal_steps > 0:
-                        frac_bc = max(0.0, 1.0 - (float(current_total_steps) / max(1.0, float(self.kl_bc_anneal_steps))))
-                        bc_alpha = self.kl_bc_coef_final + (self.kl_bc_coef0 - self.kl_bc_coef_final) * frac_bc
+                if train_actor:
+                    # Actor Update
+                    dist = self.actor(obs[mb])
+                    logp = dist.log_prob(act[mb])
+                    ratio = torch.exp(logp - logp_old[mb])
+                    
+                    # Asymmetric Advantage Gating:
+                    # Gate positive advantages (don't overfit to OOD luck)
+                    # Pass negative advantages fully (learn from OOD mistakes)
+                    adv_mb = adv[mb]
+                    adv_gated = torch.where(adv_mb > 0, adv_mb * w[mb], adv_mb)
+                    
+                    # Normalize after gating for stability
+                    if adv_gated.std() > 1e-8:
+                        adv_gated = (adv_gated - adv_gated.mean()) / (adv_gated.std() + 1e-8)
+                    
+                    if self.support_adaptive_clip:
+                        coef = 0.5 + 0.5 * w[mb]
+                        clip_low = 1 - self.clip_ratio * coef
+                        clip_high = 1 + self.clip_ratio * coef
+                        clip_adv = torch.clamp(ratio, clip_low, clip_high) * adv_gated
                     else:
-                        bc_alpha = self.kl_bc_coef
+                        clip_adv = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * adv_gated
                     
-                    with torch.no_grad():
-                        w_bc = torch.clamp(1.0 - support[mb], 0.0, 1.0)
-                        if self.kl_bc_pow is not None and self.kl_bc_pow != 1.0:
-                            w_bc = torch.pow(w_bc, self.kl_bc_pow)
+                    ppo_obj = torch.min(ratio * adv_gated, clip_adv)
+                    loss_actor = -(ppo_obj).mean()
+
+                    # BC Anchor
+                    if self.kl_bc_coef is not None and self.kl_bc_coef > 0 and self.ref_actor is not None:
+                        if self.kl_bc_anneal_steps is not None and self.kl_bc_anneal_steps > 0:
+                            frac_bc = max(0.0, 1.0 - (float(current_total_steps) / max(1.0, float(self.kl_bc_anneal_steps))))
+                            bc_alpha = self.kl_bc_coef_final + (self.kl_bc_coef0 - self.kl_bc_coef_final) * frac_bc
+                        else:
+                            bc_alpha = self.kl_bc_coef
+                        
+                        with torch.no_grad():
+                            w_bc = torch.clamp(1.0 - support[mb], 0.0, 1.0)
+                            if self.kl_bc_pow is not None and self.kl_bc_pow != 1.0:
+                                w_bc = torch.pow(w_bc, self.kl_bc_pow)
+                        
+                        dist_ref = self.ref_actor(obs[mb])
+                        logp_ref = dist_ref.log_prob(act[mb])
+                        bc_reg = -(w_bc * logp_ref).mean()
+                        loss_actor = loss_actor + bc_alpha * bc_reg
+                        bc_alpha_value = float(bc_alpha)
                     
-                    dist_ref = self.ref_actor(obs[mb])
-                    logp_ref = dist_ref.log_prob(act[mb])
-                    bc_reg = -(w_bc * logp_ref).mean()
-                    loss_actor = loss_actor + bc_alpha * bc_reg
-                    bc_alpha_value = float(bc_alpha)
-                
-                ent = dist.entropy().mean()
-                
-                self.opt_actor.zero_grad()
-                (loss_actor - self.ent_coeff * ent).backward()
-                if self.actor_grad_clip is not None and self.actor_grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.actor_grad_clip)
-                self.opt_actor.step()
+                    ent = dist.entropy().mean()
+                    
+                    self.opt_actor.zero_grad()
+                    (loss_actor - self.ent_coeff * ent).backward()
+                    if self.actor_grad_clip is not None and self.actor_grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.actor_grad_clip)
+                    self.opt_actor.step()
 
                 # Critic Update
                 v = self.critic(obs[mb])
@@ -283,18 +284,20 @@ class PPOAgent:
                     torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.critic_grad_clip)
                 self.opt_critic.step()
 
-                # KL Check
-                with torch.no_grad():
-                    kl = (logp_old[mb] - logp).mean().abs().item()
-                    approx_kl_mean += kl * len(mb)
-                    kl_count += len(mb)
-                    if self.target_kl is not None and kl > 1.5 * self.target_kl:
-                        early_stop = True
-                        break
+                # KL Check (only meaningful if actor was updated)
+                if train_actor:
+                    with torch.no_grad():
+                        kl = (logp_old[mb] - logp).mean().abs().item()
+                        approx_kl_mean += kl * len(mb)
+                        kl_count += len(mb)
+                        if self.target_kl is not None and kl > 1.5 * self.target_kl:
+                            early_stop = True
+                            break
 
                 bs = len(mb)
                 avg_v_mse += mse.detach().item() * bs
-                avg_loss_actor += loss_actor.detach().item() * bs
+                if train_actor:
+                    avg_loss_actor += loss_actor.detach().item() * bs
                 count += bs
             if early_stop:
                 break

@@ -59,6 +59,7 @@ def main():
     parser.add_argument("--kl_bc_coef0", type=float, default=0.0)
     parser.add_argument("--kl_bc_coef_final", type=float, default=0.0)
     parser.add_argument("--kl_bc_anneal_steps", type=float, default=0.0)
+    parser.add_argument("--actor_freeze_steps", type=int, default=0, help="Steps to train critic only before actor updates")
     # early stopping and logging
     parser.add_argument("--early_stop_avg_return", type=float, default=None)
     parser.add_argument("--early_stop_window", type=int, default=10)
@@ -151,10 +152,11 @@ def main():
 
     if args.init_actor:
         agent.actor.load_state_dict(torch.load(args.init_actor))
-        print("Resetting Actor LogStd for Online Exploration...")
-        with torch.no_grad():
-            # Set log_std to -0.5 (approx 0.6 std dev) to allow exploration
-            agent.actor.log_std.fill_(-0.5)
+        if not spec.discrete and hasattr(agent.actor, "log_std"):
+            print("Resetting Actor LogStd for Online Exploration...")
+            with torch.no_grad():
+                # Set log_std to -0.5 (approx 0.6 std dev) to allow exploration
+                agent.actor.log_std.fill_(-0.5)
 
     # Observation Normalization for PPO only
     class RunningNorm:
@@ -307,7 +309,8 @@ def main():
             buf["rew"].append(r_total)
             buf["val"].append(v)
             buf["logp"].append(logp)
-            buf["done"].append(float(done or truncated))
+            # Only mark true environment termination; truncate should still bootstrap
+            buf["done"].append(float(done))
             buf["support"].append(sup_mean)
             buf["support_std"].append(sup_std)
 
@@ -363,7 +366,14 @@ def main():
             buf = {k: [] for k in buf}
             continue
 
-        metrics = agent.update(batch, minibatch_size=args.minibatch_size, train_iters=args.train_iters, current_total_steps=t)
+        train_actor = t >= args.actor_freeze_steps
+        metrics = agent.update(
+            batch,
+            minibatch_size=args.minibatch_size,
+            train_iters=args.train_iters,
+            current_total_steps=t,
+            train_actor=train_actor,
+        )
         buf = {k: [] for k in buf}
 
         avg_ret = np.mean(ep_returns) if len(ep_returns) else 0.0
