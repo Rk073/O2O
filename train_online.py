@@ -182,6 +182,12 @@ def main():
 
     obs_rn = RunningNorm(spec.state_dim, clip=args.obs_norm_clip) if args.obs_norm else None
     
+    # PROFESSOR FIX: Initialize RunningNorm with Offline Statistics from DSR
+    if obs_rn is not None and hasattr(dsr, "meta"):
+        print(f"[train_online] Initializing observation normalizer from DSR metadata...")
+        obs_rn.mean = dsr.meta.state_mean.astype(np.float32)
+        obs_rn.M2 = (dsr.meta.state_std.astype(np.float32) ** 2) * obs_rn.count
+
     def get_obs_p(raw_obs):
         if obs_rn is not None:
             obs_rn.update(raw_obs)
@@ -331,11 +337,11 @@ def main():
             if done or truncated:
                 # Prevent value bleed across episodes: treat truncation as terminal for advantages
                 if truncated and len(buf["done"]) > 0:
-                   
-                    ep_returns.append(ep_ret)
-                    obs = env.reset()[0]
-                    obs_p = get_obs_p(obs)
-                    ep_ret, ep_len = 0.0, 0
+                    buf["done"][-1] = 1.0
+                ep_returns.append(ep_ret)
+                obs = env.reset()[0]
+                obs_p = get_obs_p(obs)
+                ep_ret, ep_len = 0.0, 0
 
             if t >= args.total_steps:
                 break
